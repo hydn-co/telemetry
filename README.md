@@ -38,9 +38,13 @@ Datadog correlates logs and traces when logs have top-level `trace_id` and `span
 
 ## Dependency
 
+The module is published and available via the Go proxy:
+
 ```bash
-go get github.com/hydn-co/telemetry@v0.0.0
+go get github.com/hydn-co/telemetry@latest
 ```
+
+Or pin a specific version (e.g. `@v0.0.1`).
 
 For local development in a multi-repo layout, add to your `go.mod`:
 
