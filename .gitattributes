@@ -1,0 +1,31 @@
+# Default behavior: normalize line endings to LF on commit
+* text=auto eol=lf
+
+# Go: ensure consistent diff and line endings
+*.go text diff=golang
+
+# Markdown and docs
+*.md text
+*.mdx text
+
+# Scripts
+*.sh text eol=lf
+*.ps1 text eol=lf
+
+# Explicit binaries (no line-ending conversion)
+*.exe binary
+*.dll binary
+*.so binary
+*.dylib binary
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+
+# Export-ignore: exclude from git archive (optional)
+# /CODE_REVIEW.md
+# /docs/

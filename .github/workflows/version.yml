@@ -1,0 +1,46 @@
+name: Version
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      semver:
+        value: ${{ jobs.version.outputs.semver }}
+        description: "Semantic version (e.g. 1.2.3 or 1.2.3-alpha.1)"
+
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      semver: ${{ steps.version.outputs.semVer }}
+
+    steps:
+      - name: Checkout Full History
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install GitVersion
+        uses: gittools/actions/gitversion/setup@vs4.3.3
+
+      - name: Calculate Version
+        id: version
+        uses: gittools/actions/gitversion/execute@v4.3.3
+
+      - name: Echo Version
+        run: |
+          echo "## Version"
+          echo "semVer:              ${{ steps.version.outputs.semVer }}"
+          echo "fullSemVer:         ${{ steps.version.outputs.fullSemVer }}"
+          echo "majorMinorPatch:     ${{ steps.version.outputs.majorMinorPatch }}"
+          echo "preReleaseTag:       ${{ steps.version.outputs.preReleaseTag }}"
+          echo "informationalVersion:${{ steps.version.outputs.informationalVersion }}"
+          echo "branchName:          ${{ steps.version.outputs.branchName }}"
+          echo "shortSha:            ${{ steps.version.outputs.shortSha }}"
+          echo "versionSourceDistance: ${{ steps.version.outputs.versionSourceDistance }}"

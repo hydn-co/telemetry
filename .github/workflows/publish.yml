@@ -1,0 +1,38 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+jobs:
+  version:
+    name: Get Version
+    uses: ./.github/workflows/version.yml
+
+  tag-and-publish:
+    name: Tag and Notify Go Proxy
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Full History
+        uses: actions/checkout@v6
+
+      - name: Tag Commit
+        uses: hydn-co/build-tools/.github/actions/create-tag@main
+        with:
+          semver: ${{ needs.version.outputs.semver }}
+
+      - name: Notify Go Proxy
+        uses: hydn-co/build-tools/.github/actions/notify-go-proxy@main
+        with:
+          module: github.com/${{ github.repository }}
+          version: ${{ needs.version.outputs.semver }}
+
+      - name: Prune Pre-release Tags
+        uses: hydn-co/build-tools/.github/actions/prune-tags@main
