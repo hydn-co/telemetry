@@ -24,7 +24,7 @@ import (
 // Environment variable names read by this package.
 // All four are required; Setup panics if any are missing (fail fast).
 const (
-	EnvOTELExporterOTLPEndpoint   = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	EnvOTELExporterOTLPEndpoint  = "OTEL_EXPORTER_OTLP_ENDPOINT"
 	EnvOTELServiceName           = "OTEL_SERVICE_NAME"
 	EnvOTELDeploymentEnvironment = "OTEL_DEPLOYMENT_ENVIRONMENT"
 	EnvOTELServiceVersion        = "OTEL_SERVICE_VERSION"

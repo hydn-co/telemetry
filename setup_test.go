@@ -7,8 +7,8 @@ import (
 
 func TestSetup_PanicsWhenEnvMissing(t *testing.T) {
 	tests := []struct {
-		name    string
-		setEnv  func(*testing.T)
+		name      string
+		setEnv    func(*testing.T)
 		wantPanic bool
 	}{
 		{
