@@ -168,8 +168,9 @@ func Setup(ctx context.Context, opts Options) func() {
 	handler = &correlationHandler{next: handler, serviceName: serviceName, env: environment, version: version}
 	slog.SetDefault(slog.New(handler))
 
-	// OTLP tracing (best-effort; logging already works)
-	exp, err := otlptracegrpc.New(ctx)
+	// OTLP tracing (best-effort; logging already works).
+	// WithInsecure() is required for the local Datadog agent sidecar (plain gRPC on 127.0.0.1:4317).
+	exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure())
 	if err != nil {
 		slog.Error("failed to create OTLP trace exporter", slog.String("error", err.Error()))
 		return makeShutdownFunc(nil, logFile, serviceName, version, environment)
