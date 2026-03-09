@@ -154,7 +154,8 @@ func Setup(ctx context.Context, opts Options) func() {
 	stdoutHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
 	var handler slog.Handler = stdoutHandler
 	var logFile *os.File
-	if logPath := os.Getenv(EnvLogFile); logPath != "" {
+	logPath := os.Getenv(EnvLogFile)
+	if logPath != "" {
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 		if err != nil {
 			// Log before installing our handler so any configured logger sees it
@@ -167,6 +168,11 @@ func Setup(ctx context.Context, opts Options) func() {
 	}
 	handler = &correlationHandler{next: handler, serviceName: serviceName, env: environment, version: version}
 	slog.SetDefault(slog.New(handler))
+	initLogFile := "stdout only"
+	if logPath != "" {
+		initLogFile = logPath
+	}
+	slog.Info("telemetry initialized", "log_file", initLogFile)
 
 	// OTLP tracing (best-effort; logging already works).
 	// WithInsecure() is required for the local Datadog agent sidecar (plain gRPC on 127.0.0.1:4317).
