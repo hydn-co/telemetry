@@ -9,6 +9,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"go.opentelemetry.io/contrib/bridges/otelslog"
@@ -21,42 +22,47 @@ import (
 )
 
 // Environment variable names read by this package.
-// Set by deployment (e.g. when running with a Datadog agent sidecar).
+// All four are required; Setup panics if any are missing (fail fast).
 const (
-	EnvOTELExporterOTLPEndpoint = "OTEL_EXPORTER_OTLP_ENDPOINT"
-	EnvOTELServiceName          = "OTEL_SERVICE_NAME"
+	EnvOTELExporterOTLPEndpoint   = "OTEL_EXPORTER_OTLP_ENDPOINT"
+	EnvOTELServiceName           = "OTEL_SERVICE_NAME"
+	EnvOTELDeploymentEnvironment = "OTEL_DEPLOYMENT_ENVIRONMENT"
+	EnvOTELServiceVersion        = "OTEL_SERVICE_VERSION"
 )
 
-// Options configures Setup. ServiceName is used for the OTel resource and slog
-// correlation; if empty, OTEL_SERVICE_NAME from env or "unknown" is used.
-type Options struct {
-	ServiceName string // e.g. "mesh-stream"
-	Version     string // optional; set on OTel resource as service.version and used in shutdown logging
-	Environment string // optional; set on OTel resource as deployment.environment (e.g. dev1, prod)
+// Options is reserved for future use. All configuration is from env vars.
+type Options struct{}
+
+// requireOTELEnv panics if any required OTEL env var is missing (fail fast).
+func requireOTELEnv() {
+	var missing []string
+	if os.Getenv(EnvOTELExporterOTLPEndpoint) == "" {
+		missing = append(missing, EnvOTELExporterOTLPEndpoint)
+	}
+	if os.Getenv(EnvOTELServiceName) == "" {
+		missing = append(missing, EnvOTELServiceName)
+	}
+	if os.Getenv(EnvOTELDeploymentEnvironment) == "" {
+		missing = append(missing, EnvOTELDeploymentEnvironment)
+	}
+	if os.Getenv(EnvOTELServiceVersion) == "" {
+		missing = append(missing, EnvOTELServiceVersion)
+	}
+	if len(missing) > 0 {
+		panic("telemetry: missing required environment variables: " + strings.Join(missing, ", "))
+	}
 }
 
-// Enabled returns whether OpenTelemetry should be initialized based on environment.
-// When true, OTEL_EXPORTER_OTLP_ENDPOINT or OTEL_SERVICE_NAME is set.
-func Enabled() bool {
-	return os.Getenv(EnvOTELExporterOTLPEndpoint) != "" || os.Getenv(EnvOTELServiceName) != ""
-}
-
-// Setup initializes OpenTelemetry tracing and log-trace correlation when OTEL_*
-// env vars indicate it (e.g. when running with a Datadog agent sidecar). Otherwise
-// returns a no-op shutdown. The returned function should be called on process exit.
+// Setup initializes OpenTelemetry tracing and log-trace correlation. Required env vars
+// OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, OTEL_DEPLOYMENT_ENVIRONMENT, and
+// OTEL_SERVICE_VERSION must be set; Setup panics otherwise (fail fast). The returned
+// function should be called on process exit.
 func Setup(ctx context.Context, opts Options) func() {
-	serviceName := opts.ServiceName
-	if serviceName == "" {
-		serviceName = os.Getenv(EnvOTELServiceName)
-	}
-	if serviceName == "" {
-		serviceName = "unknown"
-	}
-	version := opts.Version
+	requireOTELEnv()
 
-	if !Enabled() {
-		return func() {} // no-op; safe to call multiple times
-	}
+	serviceName := os.Getenv(EnvOTELServiceName)
+	environment := os.Getenv(EnvOTELDeploymentEnvironment)
+	version := os.Getenv(EnvOTELServiceVersion)
 
 	// OTLP gRPC exporter (reads OTEL_EXPORTER_OTLP_ENDPOINT from env when not in options)
 	exp, err := otlptracegrpc.New(ctx)
@@ -65,12 +71,10 @@ func Setup(ctx context.Context, opts Options) func() {
 		return func() {}
 	}
 
-	attrs := []attribute.KeyValue{semconv.ServiceNameKey.String(serviceName)}
-	if opts.Environment != "" {
-		attrs = append(attrs, semconv.DeploymentEnvironmentKey.String(opts.Environment))
-	}
-	if version != "" {
-		attrs = append(attrs, semconv.ServiceVersionKey.String(version))
+	attrs := []attribute.KeyValue{
+		semconv.ServiceNameKey.String(serviceName),
+		semconv.DeploymentEnvironmentKey.String(environment),
+		semconv.ServiceVersionKey.String(version),
 	}
 	res, err := resource.Merge(
 		resource.Default(),
@@ -95,6 +99,7 @@ func Setup(ctx context.Context, opts Options) func() {
 		slog.InfoContext(ctx, "telemetry shutdown",
 			slog.String("service", serviceName),
 			slog.String("version", version),
+			slog.String("environment", environment),
 		)
 		// Use a fresh context so shutdown/flush runs even if the caller's ctx is already cancelled.
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

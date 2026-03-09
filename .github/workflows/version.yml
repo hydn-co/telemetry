@@ -27,7 +27,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install GitVersion
-        uses: gittools/actions/gitversion/setup@vs4.3.3
+        uses: gittools/actions/gitversion/setup@v4.3.3
 
       - name: Calculate Version
         id: version
