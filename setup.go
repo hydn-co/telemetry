@@ -1,10 +1,11 @@
-// Package telemetry provides shared OpenTelemetry setup for mesh services: tracing (OTLP)
-// and log-trace correlation via the slog bridge. Configuration is read from standard
-// OTEL_* environment variables so the same code can be reused across projects.
+// Package telemetry provides shared OpenTelemetry tracing (OTLP) and structured
+// JSON slog logging with Datadog-friendly correlation. Configuration is read from
+// OTEL_* and LOG_FILE environment variables so the same code can be reused across projects.
 //
-// When LOG_FILE is set, logs are also written to that path (JSON, one record per line)
-// for Datadog sidecar file tailing. The file is opened append-only and shared with the sidecar
-// via a shared volume (e.g. /LogFiles/app.log).
+// Primary logging is standard slog JSON to stdout (and optionally to a file when
+// LOG_FILE is set). Each log record gets service, env, and version from env, and
+// trace_id/span_id when the log context has an active span. No OpenTelemetry logs
+// export is required; the Datadog agent can tail the log file or collect stdout.
 //
 // The function returned by Setup is safe to call multiple times; call it once on process exit (e.g. defer).
 package telemetry
@@ -16,13 +17,13 @@ import (
 	"strings"
 	"time"
 
-	"go.opentelemetry.io/contrib/bridges/otelslog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // EnvLogFile is the optional path for file-based log collection (e.g. /LogFiles/app.log for Datadog sidecar).
@@ -58,6 +59,43 @@ func requireOTELEnv() {
 	if len(missing) > 0 {
 		panic("telemetry: missing required environment variables: " + strings.Join(missing, ", "))
 	}
+}
+
+// correlationHandler adds service, env, version and optionally trace_id/span_id to each record
+// so that logs are self-describing for Datadog (unified service tagging + trace correlation).
+type correlationHandler struct {
+	next        slog.Handler
+	serviceName string
+	env         string
+	version     string
+}
+
+func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.next.Enabled(ctx, level)
+}
+
+func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
+	rec := r.Clone()
+	rec.AddAttrs(
+		slog.String("service", h.serviceName),
+		slog.String("env", h.env),
+		slog.String("version", h.version),
+	)
+	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
+		rec.AddAttrs(
+			slog.String("trace_id", span.SpanContext().TraceID().String()),
+			slog.String("span_id", span.SpanContext().SpanID().String()),
+		)
+	}
+	return h.next.Handle(ctx, rec)
+}
+
+func (h *correlationHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &correlationHandler{next: h.next.WithAttrs(attrs), serviceName: h.serviceName, env: h.env, version: h.version}
+}
+
+func (h *correlationHandler) WithGroup(name string) slog.Handler {
+	return &correlationHandler{next: h.next.WithGroup(name), serviceName: h.serviceName, env: h.env, version: h.version}
 }
 
 // multiHandler forwards each log record to multiple handlers.
@@ -99,10 +137,11 @@ func (m *multiHandler) WithGroup(name string) slog.Handler {
 	return &multiHandler{handlers: next}
 }
 
-// Setup initializes OpenTelemetry tracing and log-trace correlation. Required env vars
-// OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME, OTEL_DEPLOYMENT_ENVIRONMENT, and
-// OTEL_SERVICE_VERSION must be set; Setup panics otherwise (fail fast). The returned
-// function should be called on process exit.
+// Setup initializes structured JSON logging with correlation fields, then OpenTelemetry
+// tracing. Required env vars OTEL_EXPORTER_OTLP_ENDPOINT, OTEL_SERVICE_NAME,
+// OTEL_DEPLOYMENT_ENVIRONMENT, and OTEL_SERVICE_VERSION must be set; Setup panics otherwise.
+// Logging is installed first so it works even if tracer setup fails. The returned
+// function should be called on process exit (it shuts down the tracer and closes the log file if set).
 func Setup(ctx context.Context, opts Options) func() {
 	requireOTELEnv()
 
@@ -110,11 +149,30 @@ func Setup(ctx context.Context, opts Options) func() {
 	environment := os.Getenv(EnvOTELDeploymentEnvironment)
 	version := os.Getenv(EnvOTELServiceVersion)
 
-	// OTLP gRPC exporter (reads OTEL_EXPORTER_OTLP_ENDPOINT from env when not in options)
+	// Primary logging: JSON to stdout (and optionally to LOG_FILE). Install before tracer
+	// so logs work even when tracer setup fails.
+	stdoutHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	var handler slog.Handler = stdoutHandler
+	var logFile *os.File
+	if logPath := os.Getenv(EnvLogFile); logPath != "" {
+		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			// Log before installing our handler so any configured logger sees it
+			slog.Default().Error("telemetry: failed to open log file for Datadog tailing", "path", logPath, "error", err)
+		} else {
+			logFile = f
+			fileHandler := slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
+			handler = &multiHandler{handlers: []slog.Handler{stdoutHandler, fileHandler}}
+		}
+	}
+	handler = &correlationHandler{next: handler, serviceName: serviceName, env: environment, version: version}
+	slog.SetDefault(slog.New(handler))
+
+	// OTLP tracing (best-effort; logging already works)
 	exp, err := otlptracegrpc.New(ctx)
 	if err != nil {
 		slog.Error("failed to create OTLP trace exporter", slog.String("error", err.Error()))
-		return func() {}
+		return makeShutdownFunc(nil, logFile, serviceName, version, environment)
 	}
 
 	attrs := []attribute.KeyValue{
@@ -122,15 +180,7 @@ func Setup(ctx context.Context, opts Options) func() {
 		semconv.DeploymentEnvironmentKey.String(environment),
 		semconv.ServiceVersionKey.String(version),
 	}
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(semconv.SchemaURL, attrs...),
-	)
-	if err != nil {
-		slog.Error("failed to create OTel resource", slog.String("error", err.Error()))
-		_ = exp.Shutdown(ctx)
-		return func() {}
-	}
+	res := resource.NewWithAttributes(semconv.SchemaURL, attrs...)
 
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
@@ -138,33 +188,25 @@ func Setup(ctx context.Context, opts Options) func() {
 	)
 	otel.SetTracerProvider(tp)
 
-	// Inject trace/span IDs into slog for log-trace correlation (e.g. in Datadog)
-	otelLogger := otelslog.NewLogger(serviceName)
-	handler := otelLogger.Handler()
+	return makeShutdownFunc(tp, logFile, serviceName, version, environment)
+}
 
-	if logPath := os.Getenv(EnvLogFile); logPath != "" {
-		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			slog.Error("failed to open log file for Datadog tailing", slog.String("path", logPath), slog.String("error", err.Error()))
-		} else {
-			fileHandler := slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
-			handler = &multiHandler{handlers: []slog.Handler{otelLogger.Handler(), fileHandler}}
-		}
-	}
-
-	slog.SetDefault(slog.New(handler))
-
+func makeShutdownFunc(tp *sdktrace.TracerProvider, logFile *os.File, serviceName, version, environment string) func() {
 	return func() {
-		slog.InfoContext(ctx, "telemetry shutdown",
+		slog.InfoContext(context.Background(), "telemetry shutdown",
 			slog.String("service", serviceName),
 			slog.String("version", version),
 			slog.String("environment", environment),
 		)
-		// Use a fresh context so shutdown/flush runs even if the caller's ctx is already cancelled.
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := tp.Shutdown(shutdownCtx); err != nil {
-			slog.ErrorContext(ctx, "tracer provider shutdown", slog.String("error", err.Error()))
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+		if tp != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := tp.Shutdown(shutdownCtx); err != nil {
+				slog.Error("tracer provider shutdown", slog.String("error", err.Error()))
+			}
 		}
 	}
 }
