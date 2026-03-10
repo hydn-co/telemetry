@@ -31,8 +31,7 @@ jobs:
       - name: Notify Go Proxy
         uses: hydn-co/build-tools/.github/actions/notify-go-proxy@main
         with:
-          module: github.com/${{ github.repository }}
-          version: ${{ needs.version.outputs.semver }}
+          tag: ${{ needs.version.outputs.semver }}
 
       - name: Prune Pre-release Tags
         uses: hydn-co/build-tools/.github/actions/prune-tags@main
