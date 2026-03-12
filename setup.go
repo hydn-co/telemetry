@@ -85,10 +85,16 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 	return h.next.Enabled(ctx, level)
 }
 
+// attrServiceName is a flat string attribute for the service name. Pipelines (e.g. Datadog)
+// can map this to the Service facet when "service" is rendered as a nested object from
+// OTLP resource (name/version/instance) and the facet expects a string.
+const attrServiceName = "service_name"
+
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 	rec := r.Clone()
 	rec.AddAttrs(
 		slog.String("service", h.serviceName),
+		slog.String(attrServiceName, h.serviceName), // flat string for pipeline → Service facet
 		slog.String("env", h.env),
 		slog.String("version", h.version),
 	)
@@ -260,11 +266,24 @@ func newLogger(handlers []slog.Handler, serviceName, environment, version string
 	return slog.New(handler)
 }
 
+// attrKeyDatadogLogSource is the resource attribute Datadog uses to set the log
+// source (ddsource). When set on the OTLP resource, the agent maps it so
+// source is defined in Datadog instead of "undefined".
+const attrKeyDatadogLogSource = "datadog.log.source"
+
 func telemetryResource(serviceName, environment, version string) *resource.Resource {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	// Use only flat string attributes so the pipeline doesn't build a nested "service"
+	// object that overwrites the Service facet. Datadog maps these to service, env, version, host, source.
 	attrs := []attribute.KeyValue{
-		semconv.ServiceNameKey.String(serviceName),
+		attribute.String("service", serviceName),
+		attribute.String("version", version),
 		semconv.DeploymentEnvironmentKey.String(environment),
-		semconv.ServiceVersionKey.String(version),
+		semconv.HostName(hostname),
+		attribute.String(attrKeyDatadogLogSource, "go"),
 	}
 	return resource.NewWithAttributes(semconv.SchemaURL, attrs...)
 }
