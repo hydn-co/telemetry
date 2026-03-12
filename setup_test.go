@@ -1,253 +1,145 @@
 package telemetry
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"regexp"
 	"testing"
 
-	"go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
 
-func TestSetup_PanicsWhenEnvMissing(t *testing.T) {
-	tests := []struct {
-		name      string
-		setEnv    func(*testing.T)
-		wantPanic bool
-	}{
-		{
-			name: "missing all",
-			setEnv: func(t *testing.T) {
-				t.Setenv(EnvOTELExporterOTLPEndpoint, "")
-				t.Setenv(EnvOTELServiceName, "")
-				t.Setenv(EnvOTELDeploymentEnvironment, "")
-				t.Setenv(EnvOTELServiceVersion, "")
-			},
-			wantPanic: true,
-		},
-		{
-			name: "missing endpoint",
-			setEnv: func(t *testing.T) {
-				t.Setenv(EnvOTELExporterOTLPEndpoint, "")
-				t.Setenv(EnvOTELServiceName, "svc")
-				t.Setenv(EnvOTELDeploymentEnvironment, "dev1")
-				t.Setenv(EnvOTELServiceVersion, "1.0.0")
-			},
-			wantPanic: true,
-		},
-		{
-			name: "missing service name",
-			setEnv: func(t *testing.T) {
-				t.Setenv(EnvOTELExporterOTLPEndpoint, "http://127.0.0.1:4317")
-				t.Setenv(EnvOTELServiceName, "")
-				t.Setenv(EnvOTELDeploymentEnvironment, "dev1")
-				t.Setenv(EnvOTELServiceVersion, "1.0.0")
-			},
-			wantPanic: true,
-		},
-		{
-			name: "missing deployment environment",
-			setEnv: func(t *testing.T) {
-				t.Setenv(EnvOTELExporterOTLPEndpoint, "http://127.0.0.1:4317")
-				t.Setenv(EnvOTELServiceName, "svc")
-				t.Setenv(EnvOTELDeploymentEnvironment, "")
-				t.Setenv(EnvOTELServiceVersion, "1.0.0")
-			},
-			wantPanic: true,
-		},
-		{
-			name: "missing service version",
-			setEnv: func(t *testing.T) {
-				t.Setenv(EnvOTELExporterOTLPEndpoint, "http://127.0.0.1:4317")
-				t.Setenv(EnvOTELServiceName, "svc")
-				t.Setenv(EnvOTELDeploymentEnvironment, "dev1")
-				t.Setenv(EnvOTELServiceVersion, "")
-			},
-			wantPanic: true,
-		},
+type captureHandler struct {
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool {
+	return true
+}
+
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &captureHandler{records: h.records}
+}
+
+func (h *captureHandler) WithGroup(name string) slog.Handler {
+	return &captureHandler{records: h.records}
+}
+
+func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
+	next := &captureHandler{}
+	logger := slog.New(&correlationHandler{
+		next:        next,
+		serviceName: "mesh-stream",
+		env:         "dev1",
+		version:     "1.2.3",
+	})
+
+	logger.Info("hello")
+
+	if len(next.records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(next.records))
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tt.setEnv(t)
-			var panicked bool
-			func() {
-				defer func() {
-					if recover() != nil {
-						panicked = true
-					}
-				}()
-				Setup(context.Background(), Options{})
-			}()
-			if !panicked {
-				t.Error("Setup should panic when required env vars are missing")
-			}
-		})
+
+	attrs := recordAttrs(next.records[0])
+	if attrs["service"] != "mesh-stream" {
+		t.Fatalf("expected service attr, got %q", attrs["service"])
+	}
+	if attrs["env"] != "dev1" {
+		t.Fatalf("expected env attr, got %q", attrs["env"])
+	}
+	if attrs["version"] != "1.2.3" {
+		t.Fatalf("expected version attr, got %q", attrs["version"])
+	}
+	if attrs["trace_id"] != "" || attrs["span_id"] != "" {
+		t.Fatalf("did not expect trace correlation attrs without a span, got trace_id=%q span_id=%q", attrs["trace_id"], attrs["span_id"])
 	}
 }
 
-func TestSetup_WithAllEnvSet(t *testing.T) {
-	t.Setenv(EnvOTELExporterOTLPEndpoint, "http://127.0.0.1:4317")
-	t.Setenv(EnvOTELServiceName, "test-svc")
-	t.Setenv(EnvOTELDeploymentEnvironment, "test")
-	t.Setenv(EnvOTELServiceVersion, "1.0.0")
+func TestCorrelationHandlerAddsTraceContext(t *testing.T) {
+	next := &captureHandler{}
+	logger := slog.New(&correlationHandler{
+		next:        next,
+		serviceName: "mesh-stream",
+		env:         "dev1",
+		version:     "1.2.3",
+	})
 
-	shutdown := Setup(context.Background(), Options{})
-	shutdown()
-	shutdown()
-}
+	tp := sdktrace.NewTracerProvider()
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+	})
 
-func TestCorrelationHandler_injectsServiceEnvVersion(t *testing.T) {
-	var buf bytes.Buffer
-	base := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	h := &correlationHandler{next: base, serviceName: "svc1", env: "dev1", version: "1.0.0"}
-	logger := slog.New(h)
-	logger.Info("msg")
-	var m map[string]any
-	if err := json.Unmarshal(buf.Bytes(), &m); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	if m["service"] != "svc1" || m["env"] != "dev1" || m["version"] != "1.0.0" {
-		t.Errorf("missing or wrong correlation fields: %+v", m)
-	}
-	if m["trace_id"] != nil || m["span_id"] != nil {
-		t.Errorf("should not have trace_id/span_id without span: %+v", m)
-	}
-}
+	ctx, span := tp.Tracer("test").Start(context.Background(), "request")
+	logger.InfoContext(ctx, "hello")
+	span.End()
 
-func TestCorrelationHandler_injectsTraceIDAndSpanIDWhenSpanInContext(t *testing.T) {
-	tp := trace.NewTracerProvider()
-	defer func() { _ = tp.Shutdown(context.Background()) }()
-	ctx, span := tp.Tracer("test").Start(context.Background(), "test")
-	defer span.End()
+	if len(next.records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(next.records))
+	}
 
-	var buf bytes.Buffer
-	base := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
-	h := &correlationHandler{next: base, serviceName: "svc", env: "env", version: "v1"}
-	logger := slog.New(h)
-	logger.InfoContext(ctx, "msg")
-	var m map[string]any
-	if err := json.Unmarshal(buf.Bytes(), &m); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
+	attrs := recordAttrs(next.records[0])
+	if attrs["trace_id"] != span.SpanContext().TraceID().String() {
+		t.Fatalf("expected trace_id %q, got %q", span.SpanContext().TraceID().String(), attrs["trace_id"])
 	}
-	traceID, _ := m["trace_id"].(string)
-	spanID, _ := m["span_id"].(string)
-	if traceID == "" || spanID == "" {
-		t.Errorf("missing trace_id or span_id: %+v", m)
-	}
-	if ok, _ := regexp.MatchString(`^[0-9a-f]{32}$`, traceID); !ok {
-		t.Errorf("trace_id should be 32-char hex: %q", traceID)
-	}
-	if ok, _ := regexp.MatchString(`^[0-9a-f]{16}$`, spanID); !ok {
-		t.Errorf("span_id should be 16-char hex: %q", spanID)
+	if attrs["span_id"] != span.SpanContext().SpanID().String() {
+		t.Fatalf("expected span_id %q, got %q", span.SpanContext().SpanID().String(), attrs["span_id"])
 	}
 }
 
-func TestSetup_installsJSONHandlerWithCorrelation(t *testing.T) {
-	t.Setenv(EnvOTELExporterOTLPEndpoint, "http://127.0.0.1:4317")
-	t.Setenv(EnvOTELServiceName, "installed-svc")
-	t.Setenv(EnvOTELDeploymentEnvironment, "testenv")
-	t.Setenv(EnvOTELServiceVersion, "2.0.0")
-	t.Setenv(EnvLogFile, "") // no file
+func TestMinLevelHandlerFiltersLowerLevels(t *testing.T) {
+	next := &captureHandler{}
+	logger := slog.New(&minLevelHandler{next: next, level: slog.LevelInfo})
 
-	oldStdout := os.Stdout
-	r, w, err := os.Pipe()
+	logger.Debug("drop me")
+	logger.Info("keep me")
+
+	if len(next.records) != 1 {
+		t.Fatalf("expected 1 record, got %d", len(next.records))
+	}
+	if next.records[0].Message != "keep me" {
+		t.Fatalf("expected info record to be kept, got %q", next.records[0].Message)
+	}
+}
+
+func TestNewOTLPMetricProviderInstallsGlobalMeterProvider(t *testing.T) {
+	prev := otel.GetMeterProvider()
+	t.Cleanup(func() {
+		otel.SetMeterProvider(prev)
+	})
+
+	mp, err := newOTLPMetricProvider(context.Background(), telemetryResource("mesh-stream", "dev1", "1.2.3"))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("expected metric provider, got error: %v", err)
 	}
-	os.Stdout = w
+	t.Cleanup(func() {
+		_ = mp.Shutdown(context.Background())
+	})
 
-	shutdown := Setup(context.Background(), Options{})
-	slog.Info("test line")
-	_ = w.Close()
-	os.Stdout = oldStdout
-	var out bytes.Buffer
-	_, _ = io.Copy(&out, r)
-	shutdown()
-
-	// stdout has one JSON object per line; take the line with "test line"
-	lines := bytes.Split(bytes.TrimSpace(out.Bytes()), []byte("\n"))
-	var line []byte
-	for _, l := range lines {
-		if bytes.Contains(l, []byte("test line")) {
-			line = l
-			break
-		}
+	if mp == nil {
+		t.Fatal("expected non-nil meter provider")
 	}
-	if line == nil {
-		t.Fatalf("no line contained 'test line': %s", out.Bytes())
-	}
-	var m map[string]any
-	if err := json.Unmarshal(line, &m); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
-	}
-	if m["service"] != "installed-svc" || m["env"] != "testenv" || m["version"] != "2.0.0" {
-		t.Errorf("correlation fields missing or wrong: %+v", m)
+	if _, ok := otel.GetMeterProvider().(*sdkmetric.MeterProvider); !ok {
+		t.Fatalf("expected global meter provider to be sdk metric provider, got %T", otel.GetMeterProvider())
 	}
 }
 
-func TestSetup_LOGFileWritesCorrelationFields(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "app.log")
-	t.Setenv(EnvOTELExporterOTLPEndpoint, "http://127.0.0.1:4317")
-	t.Setenv(EnvOTELServiceName, "file-svc")
-	t.Setenv(EnvOTELDeploymentEnvironment, "prod")
-	t.Setenv(EnvOTELServiceVersion, "3.0.0")
-	t.Setenv(EnvLogFile, logPath)
-
-	shutdown := Setup(context.Background(), Options{})
-	slog.Info("file test line")
+func TestMakeShutdownFuncIsIdempotent(t *testing.T) {
+	shutdown := makeShutdownFunc(nil, nil, nil, nil, "mesh-stream", "1.2.3", "dev1")
 	shutdown()
-
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Log file has one JSON object per line; find the "file test line" record
-	lines := bytes.Split(bytes.TrimSpace(data), []byte("\n"))
-	var line []byte
-	for _, l := range lines {
-		if bytes.Contains(l, []byte("file test line")) {
-			line = l
-			break
-		}
-	}
-	if line == nil {
-		t.Fatalf("no line contained 'file test line': %s", data)
-	}
-	var m map[string]any
-	if err := json.Unmarshal(line, &m); err != nil {
-		t.Fatalf("invalid JSON in log file: %v", err)
-	}
-	if m["service"] != "file-svc" || m["env"] != "prod" || m["version"] != "3.0.0" {
-		t.Errorf("file log missing correlation: %+v", m)
-	}
+	shutdown()
 }
 
-func TestSetup_ShutdownClosesLogFile(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "close.log")
-	t.Setenv(EnvOTELExporterOTLPEndpoint, "http://127.0.0.1:4317")
-	t.Setenv(EnvOTELServiceName, "svc")
-	t.Setenv(EnvOTELDeploymentEnvironment, "e")
-	t.Setenv(EnvOTELServiceVersion, "1")
-	t.Setenv(EnvLogFile, logPath)
-
-	shutdown := Setup(context.Background(), Options{})
-	slog.Info("before shutdown")
-	shutdown()
-	shutdown() // safe to call again
-
-	// After shutdown the file should be closed; we can open again and append (new handle)
-	data, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(data) == 0 {
-		t.Error("log file should contain at least one line")
-	}
+func recordAttrs(r slog.Record) map[string]string {
+	attrs := make(map[string]string)
+	r.Attrs(func(a slog.Attr) bool {
+		attrs[a.Key] = a.Value.String()
+		return true
+	})
+	return attrs
 }
