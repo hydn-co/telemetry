@@ -16,6 +16,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -268,6 +270,27 @@ func newLogger(handlers []slog.Handler, serviceName, environment, version string
 // source is defined in Datadog instead of "undefined".
 const attrKeyDatadogLogSource = "datadog.log.source"
 
+// otelSDKVersion is the OpenTelemetry Go SDK version used for telemetry.sdk.version
+// resource attribute. Matches go.opentelemetry.io/otel/sdk in go.mod.
+const otelSDKVersion = "1.42.0"
+
+// Optional environment variables for resource attributes (K8s, ACA, cloud).
+// When set, the corresponding semconv attributes are added to the resource.
+const (
+	envServiceNamespace     = "OTEL_SERVICE_NAMESPACE"
+	envPodName              = "POD_NAME"
+	envPodNamespace         = "POD_NAMESPACE"
+	envPodUID               = "POD_UID"
+	envNodeName             = "NODE_NAME"
+	envContainerName        = "CONTAINER_NAME"
+	envContainerAppName     = "CONTAINER_APP_NAME"
+	envContainerAppReplica  = "CONTAINER_APP_REPLICA_NAME"
+	envContainerAppRevision = "CONTAINER_APP_REVISION"
+	envAWSRegion            = "AWS_REGION"
+	envAzureRegion          = "AZURE_REGION"
+	envGCPRegion            = "GOOGLE_CLOUD_REGION"
+)
+
 func telemetryResource(serviceName, environment, version string) *resource.Resource {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
@@ -275,15 +298,110 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	}
 	// Use flat string attributes only. Empty schemaURL prevents the pipeline (e.g. Datadog
 	// agent) from expanding resource into a nested "service" object, which overwrites the
-	// reserved "service" string and breaks the Service facet.
+	// reserved "service" string and breaks the Service facet. Set both flat "version" and
+	// semconv service.version to the semver (OTEL_SERVICE_VERSION) so the pipeline uses
+	// it everywhere instead of hostname/revision.
 	attrs := []attribute.KeyValue{
+		// Service (semconv)
 		attribute.String("service", serviceName),
 		attribute.String("version", version),
+		semconv.ServiceName(serviceName),
+		semconv.ServiceVersion(version),
+		semconv.ServiceInstanceID(hostname),
+		// Deployment
 		semconv.DeploymentEnvironmentKey.String(environment),
+		// Host
 		semconv.HostName(hostname),
+		semconv.HostArchKey.String(runtime.GOARCH),
+		// Process
+		semconv.ProcessPID(os.Getpid()),
+		semconv.ProcessRuntimeName("go"),
+		semconv.ProcessRuntimeVersion(runtime.Version()),
+		semconv.ProcessRuntimeDescription("go version " + runtime.Version()),
+		// Telemetry SDK
+		semconv.TelemetrySDKName("opentelemetry"),
+		semconv.TelemetrySDKLanguageKey.String("go"),
+		semconv.TelemetrySDKVersion(otelSDKVersion),
+		// Datadog
 		attribute.String(attrKeyDatadogLogSource, "go"),
 	}
+	// Process: executable name/path, command line, parent PID (best-effort)
+	if name := processExecutableName(); name.Key != "" {
+		attrs = append(attrs, name)
+	}
+	if path, err := os.Executable(); err == nil {
+		attrs = append(attrs, semconv.ProcessExecutablePath(path))
+	}
+	if len(os.Args) > 0 {
+		attrs = append(attrs, semconv.ProcessCommand(os.Args[0]))
+		attrs = append(attrs, semconv.ProcessCommandLine(strings.Join(os.Args, " ")))
+		if len(os.Args) > 1 {
+			attrs = append(attrs, semconv.ProcessCommandArgs(os.Args[1:]...))
+		}
+	}
+	if ppid := os.Getppid(); ppid > 0 {
+		attrs = append(attrs, semconv.ProcessParentPID(ppid))
+	}
+	// OS (runtime provides GOOS)
+	attrs = append(attrs, semconv.OSName(runtime.GOOS))
+	// Optional: service.namespace
+	if v := os.Getenv(envServiceNamespace); v != "" {
+		attrs = append(attrs, semconv.ServiceNamespace(v))
+	}
+	// Optional: Kubernetes / Azure Container Apps (from env)
+	attrs = append(attrs, resourceAttrsFromEnv(hostname)...)
+	// Optional: Cloud region
+	if v := os.Getenv(envAWSRegion); v != "" {
+		attrs = append(attrs, semconv.CloudRegion(v))
+	} else if v := os.Getenv(envAzureRegion); v != "" {
+		attrs = append(attrs, semconv.CloudRegion(v))
+	} else if v := os.Getenv(envGCPRegion); v != "" {
+		attrs = append(attrs, semconv.CloudRegion(v))
+	}
 	return resource.NewWithAttributes("", attrs...)
+}
+
+// resourceAttrsFromEnv returns semconv attributes for K8s/ACA/container when the
+// corresponding environment variables are set. Pod name prefers POD_NAME, then
+// CONTAINER_APP_REPLICA_NAME, then hostname.
+func resourceAttrsFromEnv(hostname string) []attribute.KeyValue {
+	var out []attribute.KeyValue
+	podName := os.Getenv(envPodName)
+	if podName == "" {
+		podName = os.Getenv(envContainerAppReplica)
+	}
+	if podName == "" {
+		podName = hostname
+	}
+	out = append(out, semconv.K8SPodName(podName))
+	if v := os.Getenv(envPodNamespace); v != "" {
+		out = append(out, semconv.K8SNamespaceName(v))
+	}
+	if v := os.Getenv(envPodUID); v != "" {
+		out = append(out, semconv.K8SPodUID(v))
+	}
+	if v := os.Getenv(envNodeName); v != "" {
+		out = append(out, semconv.K8SNodeName(v))
+	}
+	if v := os.Getenv(envContainerAppName); v != "" {
+		out = append(out, semconv.K8SDeploymentName(v))
+	}
+	if v := os.Getenv(envContainerName); v != "" {
+		out = append(out, semconv.ContainerName(v))
+		out = append(out, semconv.K8SContainerName(v))
+	}
+	// CONTAINER_APP_REVISION has no direct semconv; could add as custom or omit
+	return out
+}
+
+// processExecutableName returns the process executable name (semconv process.executable.name).
+// Returns a zero KeyValue on error so callers can skip adding it.
+func processExecutableName() attribute.KeyValue {
+	path, err := os.Executable()
+	if err != nil {
+		return attribute.KeyValue{}
+	}
+	return semconv.ProcessExecutableName(filepath.Base(path))
 }
 
 func newOTLPLogHandler(ctx context.Context, serviceName, version string, res *resource.Resource) (*sdklog.LoggerProvider, slog.Handler, error) {
