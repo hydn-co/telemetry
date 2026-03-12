@@ -228,7 +228,7 @@ func Setup(ctx context.Context, opts Options) func() {
 	if logPath != "" {
 		initLogFile = logPath
 	}
-	slog.Info("telemetry initialized",
+	slog.Debug("telemetry initialized",
 		"log_file", initLogFile,
 		"otlp_logs_enabled", logProvider != nil,
 		"otlp_metrics_enabled", metricProvider != nil,
