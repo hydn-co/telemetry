@@ -35,7 +35,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// EnvLogFile is the optional path for file-based log collection (e.g. /LogFiles/app.log for Datadog sidecar).
+// EnvLogFile is the optional path for file-based log duplication when another
+// collector expects a file path (for example, /LogFiles/app.log).
 const EnvLogFile = "LOG_FILE"
 
 // Environment variable names read by this package.
