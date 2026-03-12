@@ -85,16 +85,13 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 	return h.next.Enabled(ctx, level)
 }
 
-// attrServiceName is a flat string attribute for the service name. Pipelines (e.g. Datadog)
-// can map this to the Service facet when "service" is rendered as a nested object from
-// OTLP resource (name/version/instance) and the facet expects a string.
-const attrServiceName = "service_name"
-
+// Flat "service" (string) is required by Datadog for the Service facet; a nested "service"
+// object from OTLP/semconv overrides it and breaks the facet. We emit only "service" here;
+// the resource is built without schema URL below so the pipeline does not build a nested object.
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 	rec := r.Clone()
 	rec.AddAttrs(
 		slog.String("service", h.serviceName),
-		slog.String(attrServiceName, h.serviceName), // flat string for pipeline → Service facet
 		slog.String("env", h.env),
 		slog.String("version", h.version),
 	)
@@ -276,8 +273,9 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	if hostname == "" {
 		hostname = "unknown"
 	}
-	// Use only flat string attributes so the pipeline doesn't build a nested "service"
-	// object that overwrites the Service facet. Datadog maps these to service, env, version, host, source.
+	// Use flat string attributes only. Empty schemaURL prevents the pipeline (e.g. Datadog
+	// agent) from expanding resource into a nested "service" object, which overwrites the
+	// reserved "service" string and breaks the Service facet.
 	attrs := []attribute.KeyValue{
 		attribute.String("service", serviceName),
 		attribute.String("version", version),
@@ -285,7 +283,7 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 		semconv.HostName(hostname),
 		attribute.String(attrKeyDatadogLogSource, "go"),
 	}
-	return resource.NewWithAttributes(semconv.SchemaURL, attrs...)
+	return resource.NewWithAttributes("", attrs...)
 }
 
 func newOTLPLogHandler(ctx context.Context, serviceName, version string, res *resource.Resource) (*sdklog.LoggerProvider, slog.Handler, error) {
@@ -300,10 +298,13 @@ func newOTLPLogHandler(ctx context.Context, serviceName, version string, res *re
 	)
 	otellogglobal.SetLoggerProvider(lp)
 
+	// Pass empty service/version so the bridge does not add record-level semconv attributes
+	// that the pipeline turns into a nested "service" object. Service/env/version come from
+	// the resource and from correlationHandler on each record (flat "service" for Datadog).
 	handler := otelslog.NewHandler(
-		serviceName,
+		"",
 		otelslog.WithLoggerProvider(lp),
-		otelslog.WithVersion(version),
+		otelslog.WithVersion(""),
 	)
 	return lp, handler, nil
 }
