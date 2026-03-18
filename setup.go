@@ -240,7 +240,7 @@ func Setup(ctx context.Context, opts Options) func() {
 	)
 
 	// OTLP tracing (best-effort; logging already works).
-	// WithInsecure() is required for the local Datadog agent sidecar (plain gRPC on 127.0.0.1:4317).
+	// WithInsecure() is used for plain gRPC to the ACA-managed OTLP endpoint (e.g. 127.0.0.1:4317).
 	exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure())
 	if err != nil {
 		slog.Error("failed to create OTLP trace exporter", slog.String("error", err.Error()))
@@ -310,8 +310,7 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 		semconv.ServiceInstanceID(hostname),
 		// Deployment
 		semconv.DeploymentEnvironmentKey.String(environment),
-		// Host
-		semconv.HostName(hostname),
+		// Host (do not set host.name in ACA — os.Hostname() is replica hostname and fragments Datadog hosts)
 		semconv.HostArchKey.String(runtime.GOARCH),
 		// Process
 		semconv.ProcessPID(os.Getpid()),
@@ -349,7 +348,7 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 		attrs = append(attrs, semconv.ServiceNamespace(v))
 	}
 	// Optional: Kubernetes / Azure Container Apps (from env)
-	attrs = append(attrs, resourceAttrsFromEnv(hostname)...)
+	attrs = append(attrs, resourceAttrsFromEnv()...)
 	// Optional: Cloud region
 	if v := os.Getenv(envAWSRegion); v != "" {
 		attrs = append(attrs, semconv.CloudRegion(v))
@@ -362,18 +361,17 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 }
 
 // resourceAttrsFromEnv returns semconv attributes for K8s/ACA/container when the
-// corresponding environment variables are set. Pod name prefers POD_NAME, then
-// CONTAINER_APP_REPLICA_NAME, then hostname.
-func resourceAttrsFromEnv(hostname string) []attribute.KeyValue {
+// corresponding environment variables are set. Pod name uses POD_NAME or
+// CONTAINER_APP_REPLICA_NAME only; do not invent a pod name from hostname.
+func resourceAttrsFromEnv() []attribute.KeyValue {
 	var out []attribute.KeyValue
 	podName := os.Getenv(envPodName)
 	if podName == "" {
 		podName = os.Getenv(envContainerAppReplica)
 	}
-	if podName == "" {
-		podName = hostname
+	if podName != "" {
+		out = append(out, semconv.K8SPodName(podName))
 	}
-	out = append(out, semconv.K8SPodName(podName))
 	if v := os.Getenv(envPodNamespace); v != "" {
 		out = append(out, semconv.K8SNamespaceName(v))
 	}
