@@ -1,22 +1,12 @@
-// Package telemetry provides Azure Container Apps-specific OpenTelemetry setup
-// for localhost OTLP export and structured JSON slog logging with Datadog-friendly
-// correlation. Configuration is read from OTEL_* and LOG_FILE environment variables
-// so the same code can be reused across projects deployed with ACA managed OTLP.
+// Package telemetry configures OpenTelemetry (OTLP/gRPC traces, metrics, logs) and a
+// correlated default slog logger for services that send telemetry to a local collector,
+// typically Azure Container Apps managed OpenTelemetry → Datadog.
 //
-// Datadog APM host billing: OTLP hostname resolution uses resource attribute
-// datadog.host.name when set (first precedence). By default this package sets it to
-// "{OTEL_SERVICE_NAME}-{OTEL_DEPLOYMENT_ENVIRONMENT}" so scaled-out replicas share one
-// billable host per service. Override with DATADOG_HOST_NAME / DD_HOSTNAME, or set
-// TELEMETRY_DATADOG_HOST_PER_REPLICA=true to use each replica's hostname (high host count).
+// See the repository README for environment variables, Datadog host coalescing
+// (datadog.host.name), and usage. Callers should invoke [Setup] only when OTLP is
+// enabled for the process; this package does not read application-specific telemetry flags.
 //
-// Primary logging is standard slog JSON to stdout by default (or stderr via Options;
-// optionally to a file when LOG_FILE is set). Each log record gets service, env, and
-// version from env, and
-// trace_id/span_id when the log context has an active span. When OTLP is available,
-// slog records are also bridged to OpenTelemetry logs so managed collectors such
-// as Azure Container Apps can forward them without a sidecar.
-//
-// The function returned by Setup is safe to call multiple times; call it once on process exit (e.g. defer).
+// The shutdown function returned by [Setup] is idempotent; defer it on exit.
 package telemetry
 
 import (
@@ -87,8 +77,6 @@ type Options struct {
 	PrimaryLogWriter io.Writer
 }
 
-// requireOTELEnv panics if any required OTEL env var is missing (fail fast).
-// This package assumes ACA injects a localhost OTLP endpoint.
 func primarySlogLevel() slog.Level {
 	v := strings.TrimSpace(os.Getenv(EnvLogLevel))
 	if v == "" {
@@ -101,6 +89,7 @@ func primarySlogLevel() slog.Level {
 	return level
 }
 
+// requireOTELEnv panics if any required OTEL env var is missing (fail fast).
 func requireOTELEnv() {
 	var missing []string
 	if os.Getenv(EnvOTELExporterOTLPEndpoint) == "" {
