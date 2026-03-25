@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
@@ -49,6 +50,9 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 	attrs := recordAttrs(next.records[0])
 	if attrs["service"] != "mesh-stream" {
 		t.Fatalf("expected service attr, got %q", attrs["service"])
+	}
+	if attrs["service.name"] != "mesh-stream" {
+		t.Fatalf("expected service.name attr, got %q", attrs["service.name"])
 	}
 	if attrs["env"] != "dev1" {
 		t.Fatalf("expected env attr, got %q", attrs["env"])
@@ -126,6 +130,51 @@ func TestNewOTLPMetricProviderInstallsGlobalMeterProvider(t *testing.T) {
 	}
 	if _, ok := otel.GetMeterProvider().(*sdkmetric.MeterProvider); !ok {
 		t.Fatalf("expected global meter provider to be sdk metric provider, got %T", otel.GetMeterProvider())
+	}
+}
+
+func TestResolveDatadogHostNameExplicitEnv(t *testing.T) {
+	t.Setenv(EnvDatadogHostName, "my-fixed-host")
+	t.Setenv(EnvTelemetryDatadogHostPerReplica, "true") // explicit host wins
+	if got := resolveDatadogHostName("svc", "dev"); got != "my-fixed-host" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestResolveDatadogHostNameDefaultCoalescesServiceEnv(t *testing.T) {
+	t.Setenv(EnvDatadogHostName, "")
+	t.Setenv(EnvDatadogHostname, "")
+	t.Setenv(EnvTelemetryDatadogHostPerReplica, "")
+	if got := resolveDatadogHostName("control-api", "dev2"); got != "control-api-dev2" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestUpsertStringAttrReplacesKey(t *testing.T) {
+	attrs := []attribute.KeyValue{attribute.String("a", "1"), attribute.String("datadog.host.name", "old")}
+	attrs = upsertStringAttr(attrs, "datadog.host.name", "new")
+	if len(attrs) != 2 {
+		t.Fatalf("len=%d", len(attrs))
+	}
+	var seen string
+	for _, a := range attrs {
+		if a.Key == "datadog.host.name" {
+			seen = a.Value.AsString()
+		}
+	}
+	if seen != "new" {
+		t.Fatalf("got %q", seen)
+	}
+}
+
+func TestAppendResourceAttributesFromEnvParsesPairs(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, " deployment.environment.name=qa , foo=bar ")
+	out := appendResourceAttributesFromEnv(nil)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 attrs, got %d", len(out))
+	}
+	if string(out[0].Key) != "deployment.environment.name" || out[0].Value.AsString() != "qa" {
+		t.Fatalf("first attr: %+v", out[0])
 	}
 }
 

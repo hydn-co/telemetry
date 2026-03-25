@@ -3,8 +3,15 @@
 // correlation. Configuration is read from OTEL_* and LOG_FILE environment variables
 // so the same code can be reused across projects deployed with ACA managed OTLP.
 //
-// Primary logging is standard slog JSON to stdout (and optionally to a file when
-// LOG_FILE is set). Each log record gets service, env, and version from env, and
+// Datadog APM host billing: OTLP hostname resolution uses resource attribute
+// datadog.host.name when set (first precedence). By default this package sets it to
+// "{OTEL_SERVICE_NAME}-{OTEL_DEPLOYMENT_ENVIRONMENT}" so scaled-out replicas share one
+// billable host per service. Override with DATADOG_HOST_NAME / DD_HOSTNAME, or set
+// TELEMETRY_DATADOG_HOST_PER_REPLICA=true to use each replica's hostname (high host count).
+//
+// Primary logging is standard slog JSON to stdout by default (or stderr via Options;
+// optionally to a file when LOG_FILE is set). Each log record gets service, env, and
+// version from env, and
 // trace_id/span_id when the log context has an active span. When OTLP is available,
 // slog records are also bridged to OpenTelemetry logs so managed collectors such
 // as Azure Container Apps can forward them without a sidecar.
@@ -14,6 +21,7 @@ package telemetry
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -50,11 +58,49 @@ const (
 	EnvOTELServiceVersion        = "OTEL_SERVICE_VERSION"
 )
 
-// Options is reserved for future use. All configuration is from env vars.
-type Options struct{}
+// EnvLogLevel is the optional slog level for the primary JSON sink and OTLP log export
+// (same threshold). Values match slog.Level.UnmarshalText (e.g. info, debug, warn).
+// Defaults to info when unset or invalid.
+const EnvLogLevel = "LOG_LEVEL"
+
+// EnvOTELResourceAttributes is optional comma-separated key=value pairs merged into the
+// OTLP resource (e.g. set by Bicep alongside DD_* for Datadog unified tagging).
+const EnvOTELResourceAttributes = "OTEL_RESOURCE_ATTRIBUTES"
+
+// EnvDatadogHostName sets OTLP resource attribute datadog.host.name (checked first by
+// Datadog hostname resolution). Use to pin billing to a stable logical host.
+const EnvDatadogHostName = "DATADOG_HOST_NAME"
+
+// EnvDatadogHostname is an alternate env var for the same override (common Datadog convention).
+const EnvDatadogHostname = "DD_HOSTNAME"
+
+// EnvTelemetryDatadogHostPerReplica, when "true" or "1", sets datadog.host.name to the
+// process hostname so each ACA/K8s replica counts as its own APM host (legacy behavior;
+// expensive on scaled-out Container Apps).
+const EnvTelemetryDatadogHostPerReplica = "TELEMETRY_DATADOG_HOST_PER_REPLICA"
+
+// Options configures Setup. Other configuration remains on OTEL_* and LOG_FILE env vars.
+type Options struct {
+	// PrimaryLogWriter is the destination for the primary JSON slog handler (before the
+	// correlation wrapper). Defaults to os.Stdout. Use os.Stderr when stdout must stay
+	// reserved (e.g. MCP JSON-RPC on stdout).
+	PrimaryLogWriter io.Writer
+}
 
 // requireOTELEnv panics if any required OTEL env var is missing (fail fast).
 // This package assumes ACA injects a localhost OTLP endpoint.
+func primarySlogLevel() slog.Level {
+	v := strings.TrimSpace(os.Getenv(EnvLogLevel))
+	if v == "" {
+		return slog.LevelInfo
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(v)); err != nil {
+		return slog.LevelInfo
+	}
+	return level
+}
+
 func requireOTELEnv() {
 	var missing []string
 	if os.Getenv(EnvOTELExporterOTLPEndpoint) == "" {
@@ -87,13 +133,13 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 	return h.next.Enabled(ctx, level)
 }
 
-// Flat "service" (string) is required by Datadog for the Service facet; a nested "service"
-// object from OTLP/semconv overrides it and breaks the facet. We emit only "service" here;
-// the resource is built without schema URL below so the pipeline does not build a nested object.
+// Emit Datadog-friendly log attributes: reserved "service"/"env"/"version" for JSON and
+// OTLP attribute "service.name" (maps to Service per Datadog semantic mapping).
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 	rec := r.Clone()
 	rec.AddAttrs(
 		slog.String("service", h.serviceName),
+		slog.String("service.name", h.serviceName),
 		slog.String("env", h.env),
 		slog.String("version", h.version),
 	)
@@ -154,7 +200,7 @@ func (m *multiHandler) WithGroup(name string) slog.Handler {
 }
 
 // minLevelHandler gates a wrapped handler by slog level. This keeps OTLP log
-// export aligned with stdout logging and avoids exporting debug noise by default.
+// export aligned with the primary JSON sink (LOG_LEVEL) and avoids noise by default.
 type minLevelHandler struct {
 	next  slog.Handler
 	level slog.Level
@@ -194,10 +240,16 @@ func Setup(ctx context.Context, opts Options) func() {
 	version := os.Getenv(EnvOTELServiceVersion)
 	res := telemetryResource(serviceName, environment, version)
 
-	// Primary logging: JSON to stdout (and optionally to LOG_FILE). Install before OTLP
-	// setup so logs work even when exporters fail.
-	stdoutHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
-	handlers := []slog.Handler{stdoutHandler}
+	primaryOut := opts.PrimaryLogWriter
+	if primaryOut == nil {
+		primaryOut = os.Stdout
+	}
+	logLevel := primarySlogLevel()
+
+	// Primary logging: JSON to PrimaryLogWriter (default stdout) and optionally LOG_FILE.
+	// Install before OTLP setup so logs work even when exporters fail.
+	primaryHandler := slog.NewJSONHandler(primaryOut, &slog.HandlerOptions{Level: logLevel})
+	handlers := []slog.Handler{primaryHandler}
 	var logFile *os.File
 	var logFileErr error
 	logPath := os.Getenv(EnvLogFile)
@@ -222,19 +274,20 @@ func Setup(ctx context.Context, opts Options) func() {
 	if err != nil {
 		slog.Error("failed to create OTLP log exporter", "error", err)
 	} else if otelLogHandler != nil {
-		handlers = append(handlers, &minLevelHandler{next: otelLogHandler, level: slog.LevelInfo})
+		handlers = append(handlers, &minLevelHandler{next: otelLogHandler, level: logLevel})
 	}
 	metricProvider, err := newOTLPMetricProvider(ctx, res)
 	if err != nil {
 		slog.Error("failed to create OTLP metric exporter", "error", err)
 	}
 	slog.SetDefault(newLogger(handlers, serviceName, environment, version))
-	initLogFile := "stdout only"
-	if logPath != "" {
-		initLogFile = logPath
+	primaryDesc := "stdout"
+	if primaryOut == os.Stderr {
+		primaryDesc = "stderr"
 	}
 	slog.Debug("telemetry initialized",
-		"log_file", initLogFile,
+		"primary_log", primaryDesc,
+		"log_file", logPath,
 		"otlp_logs_enabled", logProvider != nil,
 		"otlp_metrics_enabled", metricProvider != nil,
 	)
@@ -296,20 +349,17 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	if hostname == "" {
 		hostname = "unknown"
 	}
-	// Use flat string attributes only. Empty schemaURL prevents the pipeline (e.g. Datadog
-	// agent) from expanding resource into a nested "service" object, which overwrites the
-	// reserved "service" string and breaks the Service facet. Set both flat "version" and
-	// semconv service.version to the semver (OTEL_SERVICE_VERSION) so the pipeline uses
-	// it everywhere instead of hostname/revision.
+	// Empty schemaURL avoids some pipelines expanding resource into nested objects that
+	// confuse Datadog's Service facet. Use standard OTel resource keys only: Datadog maps
+	// service.name → service, service.version → version, deployment.environment.name → env
+	// (see https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/).
 	attrs := []attribute.KeyValue{
-		// Service (semconv)
-		attribute.String("service", serviceName),
-		attribute.String("version", version),
 		semconv.ServiceName(serviceName),
 		semconv.ServiceVersion(version),
 		semconv.ServiceInstanceID(hostname),
-		// Deployment
+		// Deployment (deprecated key + name for newer Datadog Agent / OTLP mapping)
 		semconv.DeploymentEnvironmentKey.String(environment),
+		attribute.String("deployment.environment.name", environment),
 		// Host (do not set host.name in ACA — os.Hostname() is replica hostname and fragments Datadog hosts)
 		semconv.HostArchKey.String(runtime.GOARCH),
 		// Process
@@ -357,7 +407,73 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	} else if v := os.Getenv(envGCPRegion); v != "" {
 		attrs = append(attrs, semconv.CloudRegion(v))
 	}
+	attrs = appendResourceAttributesFromEnv(attrs)
+	attrs = upsertStringAttr(attrs, "datadog.host.name", resolveDatadogHostName(serviceName, environment))
 	return resource.NewWithAttributes("", attrs...)
+}
+
+// resolveDatadogHostName returns the Datadog APM/Infrastructure hostname for OTLP resources.
+// Default is "{serviceName}-{environment}" so all replicas of the same service share one
+// billable host. Override with DATADOG_HOST_NAME or DD_HOSTNAME; opt into per-replica hosts
+// with TELEMETRY_DATADOG_HOST_PER_REPLICA=true (see https://docs.datadoghq.com/opentelemetry/mapping/hostname/).
+func resolveDatadogHostName(serviceName, environment string) string {
+	for _, k := range []string{EnvDatadogHostName, EnvDatadogHostname} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	if telemetryDatadogHostPerReplica() {
+		h, _ := os.Hostname()
+		if strings.TrimSpace(h) == "" {
+			return "unknown"
+		}
+		return h
+	}
+	return serviceName + "-" + environment
+}
+
+func telemetryDatadogHostPerReplica() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(EnvTelemetryDatadogHostPerReplica)))
+	return v == "true" || v == "1"
+}
+
+func upsertStringAttr(attrs []attribute.KeyValue, key string, v string) []attribute.KeyValue {
+	k := attribute.Key(key)
+	out := make([]attribute.KeyValue, 0, len(attrs)+1)
+	for _, a := range attrs {
+		if a.Key != k {
+			out = append(out, a)
+		}
+	}
+	out = append(out, attribute.String(key, v))
+	return out
+}
+
+// appendResourceAttributesFromEnv parses OTEL_RESOURCE_ATTRIBUTES (comma-separated k=v)
+// and appends string attributes. Duplicate keys are allowed; last writer wins in some
+// backends—call after base attrs so env can supplement Bicep-provided resource hints.
+func appendResourceAttributesFromEnv(attrs []attribute.KeyValue) []attribute.KeyValue {
+	raw := strings.TrimSpace(os.Getenv(EnvOTELResourceAttributes))
+	if raw == "" {
+		return attrs
+	}
+	for _, pair := range strings.Split(raw, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(kv[0])
+		v := strings.TrimSpace(kv[1])
+		if k == "" {
+			continue
+		}
+		attrs = append(attrs, attribute.String(k, v))
+	}
+	return attrs
 }
 
 // resourceAttrsFromEnv returns semconv attributes for K8s/ACA/container when the
