@@ -321,6 +321,9 @@ func resourceToSlogAttrs(res *resource.Resource) []slog.Attr {
 		if isBlockedHostResourceAttributeKey(string(kv.Key)) {
 			continue
 		}
+		if kv.Value.Type() == attribute.STRING && isUnexpandedSubstitution(kv.Value.AsString()) {
+			continue
+		}
 		a := otelKeyValueToSlogAttr(kv)
 		if a.Key != "" {
 			out = append(out, a)
@@ -479,17 +482,17 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	// OS (runtime provides GOOS)
 	attrs = append(attrs, semconv.OSName(runtime.GOOS))
 	// Optional: service.namespace
-	if v := os.Getenv(envServiceNamespace); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envServiceNamespace)); v != "" && !isUnexpandedSubstitution(v) {
 		attrs = append(attrs, semconv.ServiceNamespace(v))
 	}
 	// Optional: Kubernetes / Azure Container Apps (from env)
 	attrs = append(attrs, resourceAttrsFromEnv()...)
 	// Optional: Cloud region
-	if v := os.Getenv(envAWSRegion); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envAWSRegion)); v != "" && !isUnexpandedSubstitution(v) {
 		attrs = append(attrs, semconv.CloudRegion(v))
-	} else if v := os.Getenv(envAzureRegion); v != "" {
+	} else if v := strings.TrimSpace(os.Getenv(envAzureRegion)); v != "" && !isUnexpandedSubstitution(v) {
 		attrs = append(attrs, semconv.CloudRegion(v))
-	} else if v := os.Getenv(envGCPRegion); v != "" {
+	} else if v := strings.TrimSpace(os.Getenv(envGCPRegion)); v != "" && !isUnexpandedSubstitution(v) {
 		attrs = append(attrs, semconv.CloudRegion(v))
 	}
 	attrs = appendResourceAttributesFromEnv(attrs)
@@ -536,7 +539,7 @@ func appendResourceAttributesFromEnv(attrs []attribute.KeyValue) []attribute.Key
 		}
 		k := strings.TrimSpace(kv[0])
 		v := strings.TrimSpace(kv[1])
-		if k == "" || isBlockedHostResourceAttributeKey(k) {
+		if k == "" || isBlockedHostResourceAttributeKey(k) || isUnexpandedSubstitution(v) {
 			continue
 		}
 		attrs = append(attrs, attribute.String(k, v))
@@ -552,19 +555,19 @@ func resourceAttrsFromEnv() []attribute.KeyValue {
 	if podName := podNameFromEnv(); podName != "" {
 		out = append(out, semconv.K8SPodName(podName))
 	}
-	if v := os.Getenv(envPodNamespace); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envPodNamespace)); v != "" && !isUnexpandedSubstitution(v) {
 		out = append(out, semconv.K8SNamespaceName(v))
 	}
-	if v := os.Getenv(envPodUID); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envPodUID)); v != "" && !isUnexpandedSubstitution(v) {
 		out = append(out, semconv.K8SPodUID(v))
 	}
-	if v := os.Getenv(envNodeName); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envNodeName)); v != "" && !isUnexpandedSubstitution(v) {
 		out = append(out, semconv.K8SNodeName(v))
 	}
-	if v := os.Getenv(envContainerAppName); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envContainerAppName)); v != "" && !isUnexpandedSubstitution(v) {
 		out = append(out, semconv.K8SDeploymentName(v))
 	}
-	if v := os.Getenv(envContainerName); v != "" {
+	if v := strings.TrimSpace(os.Getenv(envContainerName)); v != "" && !isUnexpandedSubstitution(v) {
 		out = append(out, semconv.ContainerName(v))
 		out = append(out, semconv.K8SContainerName(v))
 	}

@@ -205,6 +205,24 @@ func TestAppendResourceAttributesFromEnvStripsHostNamespace(t *testing.T) {
 	}
 }
 
+func TestAppendResourceAttributesFromEnvSkipsUnexpandedPlaceholderValues(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "k8s.pod.name=$(CONTAINER_APP_REPLICA_NAME),foo=bar,other=${VAR}")
+	out := appendResourceAttributesFromEnv(nil)
+	if len(out) != 1 || string(out[0].Key) != "foo" || out[0].Value.AsString() != "bar" {
+		t.Fatalf("expected only foo=bar, got %+v", out)
+	}
+}
+
+func TestTelemetryResourceSkipsPlaceholderInOTELResourceAttributes(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "deployment.environment.name=$(CONTAINER_APP_REPLICA_NAME)")
+	res := telemetryResource("svc", "dev", "1.0.0")
+	for _, a := range res.Attributes() {
+		if string(a.Key) == "deployment.environment.name" && a.Value.AsString() == "$(CONTAINER_APP_REPLICA_NAME)" {
+			t.Fatal("must not merge unexpanded placeholder into OTLP resource")
+		}
+	}
+}
+
 func TestStripHostResourceAttributes(t *testing.T) {
 	in := []attribute.KeyValue{
 		attribute.String("service.name", "s"),
