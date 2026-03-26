@@ -11,7 +11,7 @@ It also installs a correlated **`log/slog`** pipeline: JSON to stdout or stderr,
 ## What `Setup` does
 
 1. **Validates** required `OTEL_*` env vars (panics if any are missing).
-2. Builds an OTLP **resource** (service, deployment, Datadog host name, optional K8s/ACA attributes).
+2. Builds an OTLP **resource** (service, deployment, optional K8s/ACA attributes). The resource **never** sets `datadog.host.name` (and strips it from `OTEL_RESOURCE_ATTRIBUTES` if present).
 3. Installs **slog**: primary JSON sink (stdout by default, or `Options.PrimaryLogWriter`), optional `LOG_FILE`, correlation fields, OTLP log bridge.
 4. Registers global **MeterProvider** (OTLP metrics) and **TracerProvider** (OTLP traces).
 5. Returns an **idempotent** shutdown function—`defer` it on exit.
@@ -39,9 +39,7 @@ Export failures for logs/metrics/traces are logged; the process keeps running wh
 |----------|---------|
 | `LOG_LEVEL` | Minimum level for the primary JSON handler and OTLP log bridge (default `info`). Values: `slog` text levels (`debug`, `info`, …). |
 | `LOG_FILE` | Append JSON logs to this path (debug level in file). Closed on shutdown. |
-| `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` pairs merged into the OTLP resource, then **`datadog.host.name` is set last** (see below). |
-| `DATADOG_HOST_NAME` / `DD_HOSTNAME` | Force OTLP resource `datadog.host.name` (overrides default and per-replica mode). |
-| `TELEMETRY_DATADOG_HOST_PER_REPLICA` | If `true` or `1`, set `datadog.host.name` to `os.Hostname()` (**increases Datadog APM host count** on scaled platforms). |
+| `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` pairs merged into the OTLP resource. Entries with key `datadog.host.name` are **ignored** so nothing in-process sets that attribute. |
 
 ### Optional resource hints (read if set)
 
@@ -54,7 +52,7 @@ Used for OTLP resource enrichment only; see `setup.go` (`resourceAttrsFromEnv`):
 ## Datadog: services, logs, and APM hosts
 
 - **Unified tagging:** Resource uses OpenTelemetry semantic keys Datadog maps to `service`, `env`, and `version` ([semantic mapping](https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/)). Each log line also includes `service`, `service.name`, `env`, and `version`, plus `trace_id` / `span_id` when the log context carries an active span.
-- **APM host billing:** Datadog resolves hostname from OTLP resources ([hostname mapping](https://docs.datadoghq.com/opentelemetry/mapping/hostname/)). This package sets **`datadog.host.name`** to **`{OTEL_SERVICE_NAME}-{OTEL_DEPLOYMENT_ENVIRONMENT}`** by default so **replicas share one logical host** per service per environment. Avoid per-replica overrides unless you intend to pay for more hosts.
+- **APM / infra host:** This package does **not** set OTLP resource **`datadog.host.name`**. Datadog derives host from its agent, cloud metadata, or other ingest rules ([hostname mapping](https://docs.datadoghq.com/opentelemetry/mapping/hostname/)).
 - **Deployment:** Many teams also set **`DD_SERVICE`**, **`DD_ENV`**, **`DD_VERSION`** in Container Apps / Kubernetes for ingest paths that read them; this package does not require them but they align with Datadog docs.
 
 ---

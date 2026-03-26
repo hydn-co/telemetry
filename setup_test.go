@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 )
@@ -64,7 +63,7 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 		t.Fatalf("expected deployment.environment.name attr, got %q", attrs["deployment.environment.name"])
 	}
 	if attrs["host"] != "" {
-		t.Fatalf("did not expect host on log records (use OTLP resource datadog.host.name), got %q", attrs["host"])
+		t.Fatalf("did not expect host on log records, got %q", attrs["host"])
 	}
 	if attrs["ddsource"] != defaultDatadogLogSource {
 		t.Fatalf("expected ddsource attr, got %q", attrs["ddsource"])
@@ -145,37 +144,20 @@ func TestNewOTLPMetricProviderInstallsGlobalMeterProvider(t *testing.T) {
 	}
 }
 
-func TestResolveDatadogHostNameExplicitEnv(t *testing.T) {
-	t.Setenv(EnvDatadogHostName, "my-fixed-host")
-	t.Setenv(EnvTelemetryDatadogHostPerReplica, "true") // explicit host wins
-	if got := resolveDatadogHostName("svc", "dev"); got != "my-fixed-host" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestResolveDatadogHostNameDefaultCoalescesServiceEnv(t *testing.T) {
-	t.Setenv(EnvDatadogHostName, "")
-	t.Setenv(EnvDatadogHostname, "")
-	t.Setenv(EnvTelemetryDatadogHostPerReplica, "")
-	if got := resolveDatadogHostName("control-api", "dev2"); got != "control-api-dev2" {
-		t.Fatalf("got %q", got)
-	}
-}
-
-func TestUpsertStringAttrReplacesKey(t *testing.T) {
-	attrs := []attribute.KeyValue{attribute.String("a", "1"), attribute.String("datadog.host.name", "old")}
-	attrs = upsertStringAttr(attrs, "datadog.host.name", "new")
-	if len(attrs) != 2 {
-		t.Fatalf("len=%d", len(attrs))
-	}
-	var seen string
-	for _, a := range attrs {
-		if a.Key == "datadog.host.name" {
-			seen = a.Value.AsString()
+func TestTelemetryResourceOmitsDatadogHostName(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "datadog.host.name=must-not-appear,foo=kept")
+	res := telemetryResource("svc", "dev", "1.0.0")
+	var sawFoo bool
+	for _, a := range res.Attributes() {
+		if string(a.Key) == "datadog.host.name" {
+			t.Fatalf("OTLP resource must not set datadog.host.name")
+		}
+		if string(a.Key) == "foo" && a.Value.AsString() == "kept" {
+			sawFoo = true
 		}
 	}
-	if seen != "new" {
-		t.Fatalf("got %q", seen)
+	if !sawFoo {
+		t.Fatal("expected OTEL_RESOURCE_ATTRIBUTES foo=kept to be merged")
 	}
 }
 
@@ -187,6 +169,17 @@ func TestAppendResourceAttributesFromEnvParsesPairs(t *testing.T) {
 	}
 	if string(out[0].Key) != "deployment.environment.name" || out[0].Value.AsString() != "qa" {
 		t.Fatalf("first attr: %+v", out[0])
+	}
+}
+
+func TestAppendResourceAttributesFromEnvStripsDatadogHostName(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "datadog.host.name=bad,foo=bar")
+	out := appendResourceAttributesFromEnv(nil)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 attr, got %d", len(out))
+	}
+	if string(out[0].Key) != "foo" || out[0].Value.AsString() != "bar" {
+		t.Fatalf("got %+v", out[0])
 	}
 }
 

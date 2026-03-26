@@ -2,8 +2,7 @@
 // correlated default slog logger for services that send telemetry to a local collector,
 // typically Azure Container Apps managed OpenTelemetry → Datadog.
 //
-// See the repository README for environment variables, Datadog host coalescing
-// (datadog.host.name), and usage. Callers should invoke [Setup] only when OTLP is
+// See the repository README for environment variables and usage. Callers should invoke [Setup] only when OTLP is
 // enabled for the process; this package does not read application-specific telemetry flags.
 //
 // The shutdown function returned by [Setup] is idempotent; defer it on exit.
@@ -55,19 +54,8 @@ const EnvLogLevel = "LOG_LEVEL"
 
 // EnvOTELResourceAttributes is optional comma-separated key=value pairs merged into the
 // OTLP resource (e.g. set by Bicep alongside DD_* for Datadog unified tagging).
+// Keys matching datadog.host.name are ignored so the SDK never emits that attribute.
 const EnvOTELResourceAttributes = "OTEL_RESOURCE_ATTRIBUTES"
-
-// EnvDatadogHostName sets OTLP resource attribute datadog.host.name (checked first by
-// Datadog hostname resolution). Use to pin billing to a stable logical host.
-const EnvDatadogHostName = "DATADOG_HOST_NAME"
-
-// EnvDatadogHostname is an alternate env var for the same override (common Datadog convention).
-const EnvDatadogHostname = "DD_HOSTNAME"
-
-// EnvTelemetryDatadogHostPerReplica, when "true" or "1", sets datadog.host.name to the
-// process hostname so each ACA/K8s replica counts as its own APM host (legacy behavior;
-// expensive on scaled-out Container Apps).
-const EnvTelemetryDatadogHostPerReplica = "TELEMETRY_DATADOG_HOST_PER_REPLICA"
 
 // Options configures Setup. Other configuration remains on OTEL_* and LOG_FILE env vars.
 type Options struct {
@@ -115,9 +103,9 @@ const defaultDatadogLogSource = "go"
 // correlationHandler adds service, env, version and optionally trace_id/span_id to each record
 // so that logs are self-describing for Datadog (unified service tagging + trace correlation).
 // It also sets ddsource, datadog.log.source, and deployment.environment.name on every record so
-// OTLP/JSON sinks get source and env when ingest ignores resource attributes. Host is not set
-// on log records: use OTLP resource datadog.host.name only so replicas do not create extra
-// Datadog hosts (see resolveDatadogHostName).
+// OTLP/JSON sinks get source and env when ingest ignores resource attributes. Host-like keys
+// are not set on log records (see datadog_host_strip.go); the OTLP resource never sets
+// datadog.host.name.
 type correlationHandler struct {
 	next        slog.Handler
 	serviceName string
@@ -416,45 +404,7 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 		attrs = append(attrs, semconv.CloudRegion(v))
 	}
 	attrs = appendResourceAttributesFromEnv(attrs)
-	attrs = upsertStringAttr(attrs, "datadog.host.name", resolveDatadogHostName(serviceName, environment))
 	return resource.NewWithAttributes("", attrs...)
-}
-
-// resolveDatadogHostName returns the Datadog APM/Infrastructure hostname for OTLP resources.
-// Default is "{serviceName}-{environment}" so all replicas of the same service share one
-// billable host. Override with DATADOG_HOST_NAME or DD_HOSTNAME; opt into per-replica hosts
-// with TELEMETRY_DATADOG_HOST_PER_REPLICA=true (see https://docs.datadoghq.com/opentelemetry/mapping/hostname/).
-func resolveDatadogHostName(serviceName, environment string) string {
-	for _, k := range []string{EnvDatadogHostName, EnvDatadogHostname} {
-		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
-			return v
-		}
-	}
-	if telemetryDatadogHostPerReplica() {
-		h, _ := os.Hostname()
-		if strings.TrimSpace(h) == "" {
-			return "unknown"
-		}
-		return h
-	}
-	return serviceName + "-" + environment
-}
-
-func telemetryDatadogHostPerReplica() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv(EnvTelemetryDatadogHostPerReplica)))
-	return v == "true" || v == "1"
-}
-
-func upsertStringAttr(attrs []attribute.KeyValue, key string, v string) []attribute.KeyValue {
-	k := attribute.Key(key)
-	out := make([]attribute.KeyValue, 0, len(attrs)+1)
-	for _, a := range attrs {
-		if a.Key != k {
-			out = append(out, a)
-		}
-	}
-	out = append(out, attribute.String(key, v))
-	return out
 }
 
 // appendResourceAttributesFromEnv parses OTEL_RESOURCE_ATTRIBUTES (comma-separated k=v)
@@ -476,7 +426,7 @@ func appendResourceAttributesFromEnv(attrs []attribute.KeyValue) []attribute.Key
 		}
 		k := strings.TrimSpace(kv[0])
 		v := strings.TrimSpace(kv[1])
-		if k == "" {
+		if k == "" || k == "datadog.host.name" {
 			continue
 		}
 		attrs = append(attrs, attribute.String(k, v))
