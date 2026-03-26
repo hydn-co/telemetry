@@ -104,39 +104,24 @@ func requireOTELEnv() {
 // defaultDatadogLogSource is the Datadog log integration name (ddsource) for Go services.
 const defaultDatadogLogSource = "go"
 
-// correlationHandler adds service, env, version and optionally trace_id/span_id to each record
-// so that logs are self-describing for Datadog (unified service tagging + trace correlation).
-// It also sets ddsource, datadog.log.source, and deployment.environment.name on every record so
-// OTLP/JSON sinks get source and env when ingest ignores resource attributes. Host-like keys
-// are not set on log records (see datadog_host_strip.go); the OTLP resource never sets
-// datadog.host.name.
+// correlationHandler attaches the same OTLP resource attributes as slog fields on every
+// record (JSON + OTLP logs) so logs match traces/metrics. It adds a nested service.name
+// group for Datadog and trace_id/span_id when a span is active. Host-like keys are stripped
+// from user records (see datadog_host_strip.go); resource-derived attrs omit the host namespace.
 type correlationHandler struct {
-	next        slog.Handler
-	serviceName string
-	env         string
-	version     string
+	next           slog.Handler
+	resourceAttrs  []slog.Attr
+	serviceName    string
 }
 
 func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool {
 	return h.next.Enabled(ctx, level)
 }
 
-// Emit Datadog-friendly log attributes: "service.name" (dotted OTLP key) plus a nested
-// slog.Group("service", "name", …) so backends that merge resource fields into a
-// service object (instance, namespace, version) also receive an explicit name key.
-// A top-level string attribute "service" is omitted — it can collide with that object
-// shape in Datadog and hide name.
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 	rec := recordStripForbiddenHostAttrs(r)
-	rec.AddAttrs(
-		slog.String("service.name", h.serviceName),
-		slog.Group("service", slog.String("name", h.serviceName)),
-		slog.String("env", h.env),
-		slog.String("version", h.version),
-		slog.String("deployment.environment.name", h.env),
-		slog.String("ddsource", defaultDatadogLogSource),
-		slog.String(attrKeyDatadogLogSource, defaultDatadogLogSource),
-	)
+	rec.AddAttrs(h.resourceAttrs...)
+	rec.AddAttrs(slog.Group("service", slog.String("name", h.serviceName)))
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
 		rec.AddAttrs(
 			slog.String("trace_id", span.SpanContext().TraceID().String()),
@@ -147,11 +132,11 @@ func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 func (h *correlationHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &correlationHandler{next: h.next.WithAttrs(attrs), serviceName: h.serviceName, env: h.env, version: h.version}
+	return &correlationHandler{next: h.next.WithAttrs(attrs), resourceAttrs: h.resourceAttrs, serviceName: h.serviceName}
 }
 
 func (h *correlationHandler) WithGroup(name string) slog.Handler {
-	return &correlationHandler{next: h.next.WithGroup(name), serviceName: h.serviceName, env: h.env, version: h.version}
+	return &correlationHandler{next: h.next.WithGroup(name), resourceAttrs: h.resourceAttrs, serviceName: h.serviceName}
 }
 
 // multiHandler forwards each log record to multiple handlers.
@@ -265,7 +250,7 @@ func Setup(ctx context.Context, opts Options) func() {
 			handlers = append(handlers, fileHandler)
 		}
 	}
-	slog.SetDefault(newLogger(handlers, serviceName, environment, version))
+	slog.SetDefault(newLogger(handlers, res, serviceName))
 	if logFileErr != nil {
 		slog.Error("telemetry: failed to open log file for Datadog tailing", "path", logPath, "error", logFileErr)
 	}
@@ -283,7 +268,7 @@ func Setup(ctx context.Context, opts Options) func() {
 	if err != nil {
 		slog.Error("failed to create OTLP metric exporter", "error", err)
 	}
-	slog.SetDefault(newLogger(handlers, serviceName, environment, version))
+	slog.SetDefault(newLogger(handlers, res, serviceName))
 	primaryDesc := "stdout"
 	if primaryOut == os.Stderr {
 		primaryDesc = "stderr"
@@ -312,13 +297,62 @@ func Setup(ctx context.Context, opts Options) func() {
 	return makeShutdownFunc(tp, logProvider, metricProvider, logFile, serviceName, version, environment)
 }
 
-func newLogger(handlers []slog.Handler, serviceName, environment, version string) *slog.Logger {
+func newLogger(handlers []slog.Handler, res *resource.Resource, serviceName string) *slog.Logger {
 	var handler slog.Handler = handlers[0]
 	if len(handlers) > 1 {
 		handler = &multiHandler{handlers: handlers}
 	}
-	handler = &correlationHandler{next: handler, serviceName: serviceName, env: environment, version: version}
+	handler = &correlationHandler{
+		next:          handler,
+		resourceAttrs: resourceToSlogAttrs(res),
+		serviceName:   serviceName,
+	}
 	return slog.New(handler)
+}
+
+// resourceToSlogAttrs converts the OTLP resource into slog attributes so JSON and OTLP log
+// records carry the same key/value set as traces and metrics (plus trace correlation).
+func resourceToSlogAttrs(res *resource.Resource) []slog.Attr {
+	if res == nil {
+		return nil
+	}
+	var out []slog.Attr
+	for _, kv := range res.Attributes() {
+		if isBlockedHostResourceAttributeKey(string(kv.Key)) {
+			continue
+		}
+		a := otelKeyValueToSlogAttr(kv)
+		if a.Key != "" {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func otelKeyValueToSlogAttr(kv attribute.KeyValue) slog.Attr {
+	k := string(kv.Key)
+	switch kv.Value.Type() {
+	case attribute.INVALID:
+		return slog.Attr{}
+	case attribute.BOOL:
+		return slog.Bool(k, kv.Value.AsBool())
+	case attribute.INT64:
+		return slog.Int64(k, kv.Value.AsInt64())
+	case attribute.FLOAT64:
+		return slog.Float64(k, kv.Value.AsFloat64())
+	case attribute.STRING:
+		return slog.String(k, kv.Value.AsString())
+	case attribute.BOOLSLICE:
+		return slog.Any(k, kv.Value.AsBoolSlice())
+	case attribute.INT64SLICE:
+		return slog.Any(k, kv.Value.AsInt64Slice())
+	case attribute.FLOAT64SLICE:
+		return slog.Any(k, kv.Value.AsFloat64Slice())
+	case attribute.STRINGSLICE:
+		return slog.Any(k, kv.Value.AsStringSlice())
+	default:
+		return slog.String(k, kv.Value.AsString())
+	}
 }
 
 // attrKeyDatadogLogSource is the resource attribute Datadog uses to set the log
@@ -406,10 +440,13 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName(serviceName),
 		semconv.ServiceVersion(version),
+		attribute.String("version", version),
 		semconv.ServiceInstanceID(pickServiceInstanceID()),
 		// Deployment (deprecated key + name for newer Datadog Agent / OTLP mapping)
 		semconv.DeploymentEnvironmentKey.String(environment),
 		attribute.String("deployment.environment.name", environment),
+		attribute.String("env", environment),
+		attribute.String("ddsource", defaultDatadogLogSource),
 		// Process
 		semconv.ProcessPID(os.Getpid()),
 		semconv.ProcessRuntimeName("go"),

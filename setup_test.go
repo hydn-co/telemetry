@@ -35,12 +35,12 @@ func (h *captureHandler) WithGroup(name string) slog.Handler {
 }
 
 func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
+	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:        next,
-		serviceName: "mesh-stream",
-		env:         "dev1",
-		version:     "1.2.3",
+		next:          next,
+		resourceAttrs: resourceToSlogAttrs(res),
+		serviceName:   "mesh-stream",
 	})
 
 	logger.Info("hello")
@@ -80,12 +80,12 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 }
 
 func TestCorrelationHandlerAddsTraceContext(t *testing.T) {
+	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:        next,
-		serviceName: "mesh-stream",
-		env:         "dev1",
-		version:     "1.2.3",
+		next:          next,
+		resourceAttrs: resourceToSlogAttrs(res),
+		serviceName:   "mesh-stream",
 	})
 
 	tp := sdktrace.NewTracerProvider()

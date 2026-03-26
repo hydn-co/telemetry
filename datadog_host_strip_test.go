@@ -55,10 +55,9 @@ func TestRecordStripForbiddenHostAttrsNestedGroup(t *testing.T) {
 func TestCorrelationHandlerStripsHostFromRecord(t *testing.T) {
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:        next,
-		serviceName: "svc",
-		env:         "dev",
-		version:     "1",
+		next:          next,
+		resourceAttrs: nil,
+		serviceName:   "svc",
 	})
 	r := slog.NewRecord(time.Time{}, slog.LevelInfo, "hi", 0)
 	r.AddAttrs(slog.String("host", "should-not-appear"), slog.String("k", "v"))
