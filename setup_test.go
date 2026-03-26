@@ -60,6 +60,18 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 	if attrs["version"] != "1.2.3" {
 		t.Fatalf("expected version attr, got %q", attrs["version"])
 	}
+	if attrs["deployment.environment.name"] != "dev1" {
+		t.Fatalf("expected deployment.environment.name attr, got %q", attrs["deployment.environment.name"])
+	}
+	if attrs["host"] != "" {
+		t.Fatalf("did not expect host on log records (use OTLP resource datadog.host.name), got %q", attrs["host"])
+	}
+	if attrs["ddsource"] != defaultDatadogLogSource {
+		t.Fatalf("expected ddsource attr, got %q", attrs["ddsource"])
+	}
+	if attrs[attrKeyDatadogLogSource] != defaultDatadogLogSource {
+		t.Fatalf("expected datadog.log.source attr, got %q", attrs[attrKeyDatadogLogSource])
+	}
 	if attrs["trace_id"] != "" || attrs["span_id"] != "" {
 		t.Fatalf("did not expect trace correlation attrs without a span, got trace_id=%q span_id=%q", attrs["trace_id"], attrs["span_id"])
 	}

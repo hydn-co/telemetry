@@ -109,8 +109,15 @@ func requireOTELEnv() {
 	}
 }
 
+// defaultDatadogLogSource is the Datadog log integration name (ddsource) for Go services.
+const defaultDatadogLogSource = "go"
+
 // correlationHandler adds service, env, version and optionally trace_id/span_id to each record
 // so that logs are self-describing for Datadog (unified service tagging + trace correlation).
+// It also sets ddsource, datadog.log.source, and deployment.environment.name on every record so
+// OTLP/JSON sinks get source and env when ingest ignores resource attributes. Host is not set
+// on log records: use OTLP resource datadog.host.name only so replicas do not create extra
+// Datadog hosts (see resolveDatadogHostName).
 type correlationHandler struct {
 	next        slog.Handler
 	serviceName string
@@ -125,12 +132,15 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 // Emit Datadog-friendly log attributes: reserved "service"/"env"/"version" for JSON and
 // OTLP attribute "service.name" (maps to Service per Datadog semantic mapping).
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
-	rec := r.Clone()
+	rec := recordStripForbiddenHostAttrs(r)
 	rec.AddAttrs(
 		slog.String("service", h.serviceName),
 		slog.String("service.name", h.serviceName),
 		slog.String("env", h.env),
 		slog.String("version", h.version),
+		slog.String("deployment.environment.name", h.env),
+		slog.String("ddsource", defaultDatadogLogSource),
+		slog.String(attrKeyDatadogLogSource, defaultDatadogLogSource),
 	)
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
 		rec.AddAttrs(
@@ -237,7 +247,10 @@ func Setup(ctx context.Context, opts Options) func() {
 
 	// Primary logging: JSON to PrimaryLogWriter (default stdout) and optionally LOG_FILE.
 	// Install before OTLP setup so logs work even when exporters fail.
-	primaryHandler := slog.NewJSONHandler(primaryOut, &slog.HandlerOptions{Level: logLevel})
+	primaryHandler := slog.NewJSONHandler(primaryOut, &slog.HandlerOptions{
+		Level:       logLevel,
+		ReplaceAttr: datadogHostStripReplaceAttr,
+	})
 	handlers := []slog.Handler{primaryHandler}
 	var logFile *os.File
 	var logFileErr error
@@ -250,7 +263,10 @@ func Setup(ctx context.Context, opts Options) func() {
 			// failures always use the package's structured logger.
 		} else {
 			logFile = f
-			fileHandler := slog.NewJSONHandler(f, &slog.HandlerOptions{Level: slog.LevelDebug})
+			fileHandler := slog.NewJSONHandler(f, &slog.HandlerOptions{
+				Level:       slog.LevelDebug,
+				ReplaceAttr: datadogHostStripReplaceAttr,
+			})
 			handlers = append(handlers, fileHandler)
 		}
 	}
@@ -263,7 +279,10 @@ func Setup(ctx context.Context, opts Options) func() {
 	if err != nil {
 		slog.Error("failed to create OTLP log exporter", "error", err)
 	} else if otelLogHandler != nil {
-		handlers = append(handlers, &minLevelHandler{next: otelLogHandler, level: logLevel})
+		handlers = append(handlers, &minLevelHandler{
+			next:  &stripDatadogHostHandler{next: otelLogHandler},
+			level: logLevel,
+		})
 	}
 	metricProvider, err := newOTLPMetricProvider(ctx, res)
 	if err != nil {
@@ -361,7 +380,7 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 		semconv.TelemetrySDKLanguageKey.String("go"),
 		semconv.TelemetrySDKVersion(otelSDKVersion),
 		// Datadog
-		attribute.String(attrKeyDatadogLogSource, "go"),
+		attribute.String(attrKeyDatadogLogSource, defaultDatadogLogSource),
 	}
 	// Process: executable name/path, command line, parent PID (best-effort)
 	if name := processExecutableName(); name.Key != "" {
