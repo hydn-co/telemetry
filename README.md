@@ -11,7 +11,7 @@ It also installs a correlated **`log/slog`** pipeline: JSON to stdout or stderr,
 ## What `Setup` does
 
 1. **Validates** required `OTEL_*` env vars (panics if any are missing).
-2. Builds an OTLP **resource** (service, deployment, optional K8s/ACA attributes). The resource **never** sets `datadog.host.name` (and strips it from `OTEL_RESOURCE_ATTRIBUTES` if present).
+2. Builds an OTLP **resource** (service, deployment, process, OS, optional K8s/ACA attributes). The resource **never** sets **host** semantic attributes (`host`, `host.*`, `datadog.host.name`); those keys are stripped from `OTEL_RESOURCE_ATTRIBUTES` if present.
 3. Installs **slog**: primary JSON sink (stdout by default, or `Options.PrimaryLogWriter`), optional `LOG_FILE`, correlation fields, OTLP log bridge.
 4. Registers global **MeterProvider** (OTLP metrics) and **TracerProvider** (OTLP traces).
 5. Returns an **idempotent** shutdown function—`defer` it on exit.
@@ -27,7 +27,7 @@ Export failures for logs/metrics/traces are logged; the process keeps running wh
 | Variable | Purpose |
 |----------|---------|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint (e.g. ACA-injected `127.0.0.1:4317`). |
-| `OTEL_SERVICE_NAME` | `service.name` and log field `service`. |
+| `OTEL_SERVICE_NAME` | Resource `service.name`, OTLP log bridge scope name, and per-line `service.name` + nested `service.name` log fields. |
 | `OTEL_DEPLOYMENT_ENVIRONMENT` | Deployment env (resource + log field `env`). |
 | `OTEL_SERVICE_VERSION` | `service.version` and log field `version`. |
 
@@ -39,7 +39,7 @@ Export failures for logs/metrics/traces are logged; the process keeps running wh
 |----------|---------|
 | `LOG_LEVEL` | Minimum level for the primary JSON handler and OTLP log bridge (default `info`). Values: `slog` text levels (`debug`, `info`, …). |
 | `LOG_FILE` | Append JSON logs to this path (debug level in file). Closed on shutdown. |
-| `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` pairs merged into the OTLP resource. Entries with key `datadog.host.name` are **ignored** so nothing in-process sets that attribute. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` pairs merged into the OTLP resource. Keys **`host`**, **`host.*`**, and **`datadog.host.name`** are **ignored** (this package does not emit host resource attributes). |
 
 ### Optional resource hints (read if set)
 
@@ -51,8 +51,9 @@ Used for OTLP resource enrichment only; see `setup.go` (`resourceAttrsFromEnv`):
 
 ## Datadog: services, logs, and APM hosts
 
-- **Unified tagging:** Resource uses OpenTelemetry semantic keys Datadog maps to `service`, `env`, and `version` ([semantic mapping](https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/)). Each log line also includes `service`, `service.name`, `env`, and `version`, plus `trace_id` / `span_id` when the log context carries an active span.
+- **Unified tagging:** Resource uses OpenTelemetry semantic keys Datadog maps to `service`, `env`, and `version` ([semantic mapping](https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/)). Each log line also includes the dotted key **`service.name`**, a nested **`service` → `name`** attribute group (so merged `service` objects include `name` with `instance` / `namespace` / `version`), **`env`**, and **`version`**, plus `trace_id` / `span_id` when the log context carries an active span.
 - **APM / infra host:** This package does **not** set OTLP resource **`datadog.host.name`**. Datadog derives host from its agent, cloud metadata, or other ingest rules ([hostname mapping](https://docs.datadoghq.com/opentelemetry/mapping/hostname/)).
+- **`service.instance.id`:** Set from **`CONTAINER_APP_REPLICA_NAME`**, then **`POD_NAME`**, then **`os.Hostname()`**, in that order. Values that look like unexpanded placeholders (`$(VAR)` or `${VAR}`) are skipped so misconfigured hostnames or env vars are not exported to logs. If none apply, a random `instance-…` id is used.
 - **Deployment:** Many teams also set **`DD_SERVICE`**, **`DD_ENV`**, **`DD_VERSION`** in Container Apps / Kubernetes for ingest paths that read them; this package does not require them but they align with Datadog docs.
 
 ---

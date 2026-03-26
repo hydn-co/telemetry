@@ -3,11 +3,14 @@ package telemetry
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 )
 
 type captureHandler struct {
@@ -47,11 +50,11 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 	}
 
 	attrs := recordAttrs(next.records[0])
-	if attrs["service"] != "mesh-stream" {
-		t.Fatalf("expected service attr, got %q", attrs["service"])
-	}
 	if attrs["service.name"] != "mesh-stream" {
 		t.Fatalf("expected service.name attr, got %q", attrs["service.name"])
+	}
+	if got := serviceGroupName(next.records[0]); got != "mesh-stream" {
+		t.Fatalf("expected service group name %q, got %q", "mesh-stream", got)
 	}
 	if attrs["env"] != "dev1" {
 		t.Fatalf("expected env attr, got %q", attrs["env"])
@@ -161,6 +164,17 @@ func TestTelemetryResourceOmitsDatadogHostName(t *testing.T) {
 	}
 }
 
+func TestTelemetryResourceOmitsHostNamespace(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "")
+	res := telemetryResource("svc", "dev", "1.0.0")
+	for _, a := range res.Attributes() {
+		k := string(a.Key)
+		if k == "host" || strings.HasPrefix(k, "host.") {
+			t.Fatalf("OTLP resource must not set host attributes, got %q", k)
+		}
+	}
+}
+
 func TestAppendResourceAttributesFromEnvParsesPairs(t *testing.T) {
 	t.Setenv(EnvOTELResourceAttributes, " deployment.environment.name=qa , foo=bar ")
 	out := appendResourceAttributesFromEnv(nil)
@@ -183,6 +197,118 @@ func TestAppendResourceAttributesFromEnvStripsDatadogHostName(t *testing.T) {
 	}
 }
 
+func TestAppendResourceAttributesFromEnvStripsHostNamespace(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "host.arch=amd64,host.id=x,host=foo,keep=yes")
+	out := appendResourceAttributesFromEnv(nil)
+	if len(out) != 1 || string(out[0].Key) != "keep" || out[0].Value.AsString() != "yes" {
+		t.Fatalf("got %+v", out)
+	}
+}
+
+func TestStripHostResourceAttributes(t *testing.T) {
+	in := []attribute.KeyValue{
+		attribute.String("service.name", "s"),
+		attribute.String("host.arch", "amd64"),
+		attribute.String("host.name", "n"),
+	}
+	out := stripHostResourceAttributes(in)
+	if len(out) != 1 || string(out[0].Key) != "service.name" {
+		t.Fatalf("got %+v", out)
+	}
+}
+
+func TestIsUnexpandedSubstitution(t *testing.T) {
+	tests := []struct {
+		in   string
+		want bool
+	}{
+		{"$(CONTAINER_APP_REPLICA_NAME)", true},
+		{"${CONTAINER_APP_REPLICA_NAME}", true},
+		{"  $(FOO)  ", true},
+		{"my-replica-0000001", false},
+		{"", false},
+		{"$(unclosed", false},
+	}
+	for _, tt := range tests {
+		if got := isUnexpandedSubstitution(tt.in); got != tt.want {
+			t.Errorf("isUnexpandedSubstitution(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestPickServiceInstanceIDPrefersValidReplicaEnv(t *testing.T) {
+	t.Setenv(envContainerAppReplica, "aca-replica-xyz")
+	t.Setenv(envPodName, "should-not-win")
+	if got := pickServiceInstanceID(); got != "aca-replica-xyz" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPickServiceInstanceIDSkipsPlaceholderReplicaUsesPod(t *testing.T) {
+	t.Setenv(envContainerAppReplica, "$(CONTAINER_APP_REPLICA_NAME)")
+	t.Setenv(envPodName, "real-pod-name")
+	if got := pickServiceInstanceID(); got != "real-pod-name" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestPickServiceInstanceIDSkipsPlaceholderHostnameUsesSynthetic(t *testing.T) {
+	t.Setenv(envContainerAppReplica, "$(CONTAINER_APP_REPLICA_NAME)")
+	t.Setenv(envPodName, "${POD_NAME}")
+	h := pickServiceInstanceID()
+	if isUnexpandedSubstitution(h) {
+		t.Fatalf("pickServiceInstanceID returned placeholder %q", h)
+	}
+	if strings.HasPrefix(h, "$(") || strings.HasPrefix(h, "${") {
+		t.Fatalf("unexpected %q", h)
+	}
+}
+
+func TestTelemetryResourceServiceInstanceIDNotLiteralPlaceholder(t *testing.T) {
+	t.Setenv(envContainerAppReplica, "$(CONTAINER_APP_REPLICA_NAME)")
+	t.Setenv(envPodName, "")
+	t.Setenv(EnvOTELResourceAttributes, "")
+	res := telemetryResource("svc", "dev", "1.0.0")
+	var inst string
+	for _, a := range res.Attributes() {
+		if a.Key == semconv.ServiceInstanceIDKey {
+			inst = a.Value.AsString()
+		}
+	}
+	if inst == "" {
+		t.Fatal("missing service.instance.id")
+	}
+	if isUnexpandedSubstitution(inst) {
+		t.Fatalf("service.instance.id must not be a literal placeholder, got %q", inst)
+	}
+}
+
+func TestResourceAttrsFromEnvSkipsPlaceholderPodName(t *testing.T) {
+	t.Setenv(envPodName, "$(POD_NAME)")
+	t.Setenv(envContainerAppReplica, "$(CONTAINER_APP_REPLICA_NAME)")
+	attrs := resourceAttrsFromEnv()
+	for _, a := range attrs {
+		if a.Key == semconv.K8SPodNameKey {
+			t.Fatalf("expected no k8s.pod.name when env values are placeholders, got %+v", a)
+		}
+	}
+}
+
+func TestResourceAttrsFromEnvUsesPodWhenReplicaPlaceholder(t *testing.T) {
+	t.Setenv(envContainerAppReplica, "$(CONTAINER_APP_REPLICA_NAME)")
+	t.Setenv(envPodName, "good-pod")
+	attrs := resourceAttrsFromEnv()
+	var pod string
+	for _, a := range attrs {
+		if a.Key == semconv.K8SPodNameKey {
+			pod = a.Value.AsString()
+		}
+	}
+	if pod != "good-pod" {
+		t.Fatalf("expected k8s.pod.name good-pod, got %q", pod)
+	}
+}
+
 func TestMakeShutdownFuncIsIdempotent(t *testing.T) {
 	shutdown := makeShutdownFunc(nil, nil, nil, nil, "mesh-stream", "1.2.3", "dev1")
 	shutdown()
@@ -196,4 +322,21 @@ func recordAttrs(r slog.Record) map[string]string {
 		return true
 	})
 	return attrs
+}
+
+func serviceGroupName(r slog.Record) string {
+	var out string
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key != "service" || a.Value.Kind() != slog.KindGroup {
+			return true
+		}
+		for _, ga := range a.Value.Group() {
+			if ga.Key == "name" {
+				out = ga.Value.String()
+				return false
+			}
+		}
+		return true
+	})
+	return out
 }

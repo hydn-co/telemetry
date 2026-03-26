@@ -10,11 +10,14 @@ package telemetry
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -54,7 +57,8 @@ const EnvLogLevel = "LOG_LEVEL"
 
 // EnvOTELResourceAttributes is optional comma-separated key=value pairs merged into the
 // OTLP resource (e.g. set by Bicep alongside DD_* for Datadog unified tagging).
-// Keys matching datadog.host.name are ignored so the SDK never emits that attribute.
+// Keys in the OpenTelemetry host namespace (host, host.*) and datadog.host.name are
+// ignored so the SDK never emits host resource attributes.
 const EnvOTELResourceAttributes = "OTEL_RESOURCE_ATTRIBUTES"
 
 // Options configures Setup. Other configuration remains on OTEL_* and LOG_FILE env vars.
@@ -117,13 +121,16 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 	return h.next.Enabled(ctx, level)
 }
 
-// Emit Datadog-friendly log attributes: reserved "service"/"env"/"version" for JSON and
-// OTLP attribute "service.name" (maps to Service per Datadog semantic mapping).
+// Emit Datadog-friendly log attributes: "service.name" (dotted OTLP key) plus a nested
+// slog.Group("service", "name", …) so backends that merge resource fields into a
+// service object (instance, namespace, version) also receive an explicit name key.
+// A top-level string attribute "service" is omitted — it can collide with that object
+// shape in Datadog and hide name.
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 	rec := recordStripForbiddenHostAttrs(r)
 	rec.AddAttrs(
-		slog.String("service", h.serviceName),
 		slog.String("service.name", h.serviceName),
+		slog.Group("service", slog.String("name", h.serviceName)),
 		slog.String("env", h.env),
 		slog.String("version", h.version),
 		slog.String("deployment.environment.name", h.env),
@@ -340,11 +347,58 @@ const (
 	envGCPRegion            = "GOOGLE_CLOUD_REGION"
 )
 
-func telemetryResource(serviceName, environment, version string) *resource.Resource {
-	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "unknown"
+// isUnexpandedSubstitution reports values that look like a shell/compose/ARM placeholder
+// that was never expanded (e.g. "$(CONTAINER_APP_REPLICA_NAME)"). Those must not be sent
+// as service.instance.id or k8s.pod.name.
+func isUnexpandedSubstitution(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
 	}
+	if strings.HasPrefix(s, "$(") && strings.Contains(s, ")") {
+		return true
+	}
+	if strings.HasPrefix(s, "${") && strings.Contains(s, "}") {
+		return true
+	}
+	return false
+}
+
+func pickServiceInstanceID() string {
+	for _, k := range []string{envContainerAppReplica, envPodName} {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v != "" && !isUnexpandedSubstitution(v) {
+			return v
+		}
+	}
+	if h, _ := os.Hostname(); h != "" {
+		h = strings.TrimSpace(h)
+		if !isUnexpandedSubstitution(h) {
+			return h
+		}
+	}
+	return fallbackServiceInstanceID()
+}
+
+func fallbackServiceInstanceID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "instance-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return "instance-" + hex.EncodeToString(b[:])
+}
+
+func podNameFromEnv() string {
+	for _, k := range []string{envPodName, envContainerAppReplica} {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v != "" && !isUnexpandedSubstitution(v) {
+			return v
+		}
+	}
+	return ""
+}
+
+func telemetryResource(serviceName, environment, version string) *resource.Resource {
 	// Empty schemaURL avoids some pipelines expanding resource into nested objects that
 	// confuse Datadog's Service facet. Use standard OTel resource keys only: Datadog maps
 	// service.name → service, service.version → version, deployment.environment.name → env
@@ -352,12 +406,10 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName(serviceName),
 		semconv.ServiceVersion(version),
-		semconv.ServiceInstanceID(hostname),
+		semconv.ServiceInstanceID(pickServiceInstanceID()),
 		// Deployment (deprecated key + name for newer Datadog Agent / OTLP mapping)
 		semconv.DeploymentEnvironmentKey.String(environment),
 		attribute.String("deployment.environment.name", environment),
-		// Host (do not set host.name in ACA — os.Hostname() is replica hostname and fragments Datadog hosts)
-		semconv.HostArchKey.String(runtime.GOARCH),
 		// Process
 		semconv.ProcessPID(os.Getpid()),
 		semconv.ProcessRuntimeName("go"),
@@ -404,7 +456,28 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 		attrs = append(attrs, semconv.CloudRegion(v))
 	}
 	attrs = appendResourceAttributesFromEnv(attrs)
+	attrs = stripHostResourceAttributes(attrs)
 	return resource.NewWithAttributes("", attrs...)
+}
+
+// isBlockedHostResourceAttributeKey reports OTLP resource keys we never emit: the entire
+// host semantic convention namespace and Datadog host overrides.
+func isBlockedHostResourceAttributeKey(k string) bool {
+	if k == "host" || k == "datadog.host.name" {
+		return true
+	}
+	return strings.HasPrefix(k, "host.")
+}
+
+func stripHostResourceAttributes(attrs []attribute.KeyValue) []attribute.KeyValue {
+	var out []attribute.KeyValue
+	for _, a := range attrs {
+		if isBlockedHostResourceAttributeKey(string(a.Key)) {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // appendResourceAttributesFromEnv parses OTEL_RESOURCE_ATTRIBUTES (comma-separated k=v)
@@ -426,7 +499,7 @@ func appendResourceAttributesFromEnv(attrs []attribute.KeyValue) []attribute.Key
 		}
 		k := strings.TrimSpace(kv[0])
 		v := strings.TrimSpace(kv[1])
-		if k == "" || k == "datadog.host.name" {
+		if k == "" || isBlockedHostResourceAttributeKey(k) {
 			continue
 		}
 		attrs = append(attrs, attribute.String(k, v))
@@ -439,11 +512,7 @@ func appendResourceAttributesFromEnv(attrs []attribute.KeyValue) []attribute.Key
 // CONTAINER_APP_REPLICA_NAME only; do not invent a pod name from hostname.
 func resourceAttrsFromEnv() []attribute.KeyValue {
 	var out []attribute.KeyValue
-	podName := os.Getenv(envPodName)
-	if podName == "" {
-		podName = os.Getenv(envContainerAppReplica)
-	}
-	if podName != "" {
+	if podName := podNameFromEnv(); podName != "" {
 		out = append(out, semconv.K8SPodName(podName))
 	}
 	if v := os.Getenv(envPodNamespace); v != "" {
@@ -488,11 +557,11 @@ func newOTLPLogHandler(ctx context.Context, serviceName, version string, res *re
 	)
 	otellogglobal.SetLoggerProvider(lp)
 
-	// Pass empty service/version so the bridge does not add record-level semconv attributes
-	// that the pipeline turns into a nested "service" object. Service/env/version come from
-	// the resource and from correlationHandler on each record (flat "service" for Datadog).
+	// Use OTEL service name as the bridge logger scope name. Record-level service tagging
+	// (service.name + nested service.name) comes from correlationHandler; resource carries
+	// semconv service.* for OTLP.
 	handler := otelslog.NewHandler(
-		"",
+		serviceName,
 		otelslog.WithLoggerProvider(lp),
 		otelslog.WithVersion(""),
 	)
