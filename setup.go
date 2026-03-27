@@ -3,10 +3,14 @@
 // typically Azure Container Apps managed OpenTelemetry → Datadog.
 //
 // Datadog-oriented behavior (see https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/):
-//   - OTLP resource carries service.name, service.version, deployment.environment.name, env, version,
-//     ddsource, datadog.log.source, and optional K8s/ACA attributes; host.* is never emitted.
-//   - Every log record adds standard-attribute "service" (string) for the Log Explorer Service facet,
-//     plus resource fields and trace_id/span_id (32/16 hex) when a span is active.
+//   - OTLP resource carries the full OpenTelemetry resource (service.*, process.*, telemetry.*, OS,
+//     deployment, optional K8s/ACA, etc.); host.* is never emitted.
+//   - Each log line adds a flat "service" string (Service facet), high-signal tags copied from the
+//     resource (env, version, ddsource, deployment.environment.name, cloud/K8s/container when set,
+//     OTEL_RESOURCE_ATTRIBUTES, …), and trace_id/span_id when a span is active.
+//   - service.*, process.*, telemetry.*, os.*, and deprecated deployment.environment are not copied
+//     onto every record (avoids nested "service" JSON, huge command lines, and SDK noise); they remain
+//     on the resource for traces/metrics/OTLP logs.
 //   - Container env DD_SERVICE, DD_ENV, DD_VERSION should match OTEL_*; this package does not read DD_*,
 //     but duplicate tagging on the resource from Bicep is fine.
 //
@@ -113,12 +117,9 @@ func requireOTELEnv() {
 // defaultDatadogLogSource is the Datadog log integration name (ddsource) for Go services.
 const defaultDatadogLogSource = "go"
 
-// correlationHandler attaches the same OTLP resource attributes as slog fields on every
-// record (JSON + OTLP logs) so logs match traces/metrics. It adds a top-level string field
-// "service" (Datadog standard attribute for the Service facet on JSON logs; see
-// https://docs.datadoghq.com/standard-attributes/?product=log+management) plus trace_id/span_id
-// when a span is active. Host-like keys are stripped from user records (see
-// datadog_host_strip.go); resource-derived attrs omit the host namespace.
+// correlationHandler adds Datadog-oriented fields on every record: flat "service", a small set of
+// resource-derived tags from resourceToSlogAttrs (not the full resource), and trace_id/span_id when
+// a span is active. User records are stripped of host-like keys (datadog_host_strip.go).
 type correlationHandler struct {
 	next           slog.Handler
 	resourceAttrs  []slog.Attr
@@ -132,8 +133,9 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 	rec := recordStripForbiddenHostAttrs(r)
 	rec.AddAttrs(h.resourceAttrs...)
-	// Flat "service" (not nested service.name) so Datadog Log Management maps the Service facet
-	// for stdout/JSON and OTLP pipelines; service.name also comes from resource flattening.
+	// Flat string "service" for Datadog Log Explorer Service facet. Do not duplicate service.*
+	// resource keys on the record (see resourceToSlogAttrs); Datadog nests them under "service"
+	// and breaks the facet.
 	rec.AddAttrs(slog.String("service", h.serviceName))
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
 		rec.AddAttrs(
@@ -323,15 +325,16 @@ func newLogger(handlers []slog.Handler, res *resource.Resource, serviceName stri
 	return slog.New(handler)
 }
 
-// resourceToSlogAttrs converts the OTLP resource into slog attributes so JSON and OTLP log
-// records carry the same key/value set as traces and metrics (plus trace correlation).
+// resourceToSlogAttrs converts a subset of the OTLP resource into per-log slog attributes for
+// stdout/JSON and the OTLP log bridge. Verbose namespaces stay on the resource only (see
+// skipResourceKeyOnLogRecords). correlationHandler always adds the flat string "service".
 func resourceToSlogAttrs(res *resource.Resource) []slog.Attr {
 	if res == nil {
 		return nil
 	}
 	var out []slog.Attr
 	for _, kv := range res.Attributes() {
-		if isBlockedHostResourceAttributeKey(string(kv.Key)) {
+		if skipResourceKeyOnLogRecords(string(kv.Key)) {
 			continue
 		}
 		if kv.Value.Type() == attribute.STRING && isUnexpandedSubstitution(kv.Value.AsString()) {
@@ -397,11 +400,13 @@ const (
 	envGCPRegion            = "GOOGLE_CLOUD_REGION"
 )
 
-// shellOrComposePlaceholder matches "$(VAR)" / "$(VAR_NAME)" anywhere in a string (ACA / compose
-// copy-paste). bracePlaceholder matches "${...}" (unexpanded Bicep-style or env templates).
+// shellOrComposePlaceholder matches "$(VAR)" / "$( VAR )" anywhere in a string (ACA / compose
+// copy-paste; some docs use spaces inside parens). bracePlaceholder matches "${...}" (unexpanded
+// Bicep-style or env templates). windowsEnvPlaceholder matches unexpanded "%VAR%" (Windows-style refs).
 var (
-	shellOrComposePlaceholder = regexp.MustCompile(`\$\([A-Za-z_][A-Za-z0-9_]*\)`)
+	shellOrComposePlaceholder = regexp.MustCompile(`\$\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)`)
 	bracePlaceholder          = regexp.MustCompile(`\$\{[^}]+\}`)
+	windowsEnvPlaceholder     = regexp.MustCompile(`%[A-Za-z_][A-Za-z0-9_]*%`)
 )
 
 // isUnexpandedSubstitution reports values that contain shell/compose-style "$(VAR)" or "${...}"
@@ -412,7 +417,7 @@ func isUnexpandedSubstitution(s string) bool {
 	if s == "" {
 		return false
 	}
-	return shellOrComposePlaceholder.MatchString(s) || bracePlaceholder.MatchString(s)
+	return shellOrComposePlaceholder.MatchString(s) || bracePlaceholder.MatchString(s) || windowsEnvPlaceholder.MatchString(s)
 }
 
 func pickServiceInstanceID() string {
@@ -514,6 +519,33 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	return resource.NewWithAttributes("", attrs...)
 }
 
+// skipResourceKeyOnLogRecords reports resource keys we do not copy onto every log line. The full
+// resource remains on TracerProvider, MeterProvider, and LoggerProvider for OTLP export.
+//
+// Omitted: host.* (infra host billing), service.* (flat "service" string instead; avoids Datadog
+// nesting service.name/… into a JSON object that breaks the Service facet), process.* (pid, argv,
+// command line bloat), telemetry.* (SDK identity), os.*, and deprecated deployment.environment
+// (deployment.environment.name + env are kept).
+func skipResourceKeyOnLogRecords(k string) bool {
+	if isBlockedHostResourceAttributeKey(k) {
+		return true
+	}
+	switch {
+	case strings.HasPrefix(k, "service."):
+		return true
+	case strings.HasPrefix(k, "process."):
+		return true
+	case strings.HasPrefix(k, "telemetry."):
+		return true
+	case strings.HasPrefix(k, "os."):
+		return true
+	case k == "deployment.environment":
+		return true
+	default:
+		return false
+	}
+}
+
 // isBlockedHostResourceAttributeKey reports OTLP resource keys we never emit: the entire
 // host semantic convention namespace and Datadog host overrides.
 func isBlockedHostResourceAttributeKey(k string) bool {
@@ -612,8 +644,8 @@ func newOTLPLogHandler(ctx context.Context, serviceName, version string, res *re
 	otellogglobal.SetLoggerProvider(lp)
 
 	// Scope name/version align with OTEL_SERVICE_NAME / OTEL_SERVICE_VERSION for unified
-	// tagging on OTLP logs. Per-record fields (service, service.name, env, trace_id, …)
-	// come from correlationHandler + resource.
+	// tagging on OTLP logs. Per-record fields (flat service string, env, trace_id, …) come from
+	// correlationHandler + resource (service.* resource keys are not duplicated on each record).
 	handler := otelslog.NewHandler(
 		serviceName,
 		otelslog.WithLoggerProvider(lp),

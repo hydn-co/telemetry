@@ -50,8 +50,8 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 	}
 
 	attrs := recordAttrs(next.records[0])
-	if attrs["service.name"] != "mesh-stream" {
-		t.Fatalf("expected service.name attr, got %q", attrs["service.name"])
+	if attrs["service.name"] != "" {
+		t.Fatalf("did not expect service.name on log record (Datadog nests service.* into a broken Service facet), got %q", attrs["service.name"])
 	}
 	if attrs["service"] != "mesh-stream" {
 		t.Fatalf("expected standard service attr for Datadog facet, got %q", attrs["service"])
@@ -241,7 +241,9 @@ func TestIsUnexpandedSubstitution(t *testing.T) {
 		want bool
 	}{
 		{"$(CONTAINER_APP_REPLICA_NAME)", true},
+		{"$( CONTAINER_APP_REPLICA_NAME )", true},
 		{"${CONTAINER_APP_REPLICA_NAME}", true},
+		{"%CONTAINER_APP_REPLICA_NAME%", true},
 		{"  $(FOO)  ", true},
 		{"prefix=$(CONTAINER_APP_REPLICA_NAME)", true},
 		{"attr=${otelEnvironment}", true},
@@ -333,6 +335,56 @@ func TestMakeShutdownFuncIsIdempotent(t *testing.T) {
 	shutdown := makeShutdownFunc(nil, nil, nil, nil, "mesh-stream", "1.2.3", "dev1")
 	shutdown()
 	shutdown()
+}
+
+func TestResourceToSlogAttrsOmitsVerboseResourceNamespaces(t *testing.T) {
+	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
+	attrs := resourceToSlogAttrs(res)
+	keys := make(map[string]struct{})
+	for _, a := range attrs {
+		keys[a.Key] = struct{}{}
+	}
+	for _, banned := range []string{
+		"service.name",
+		"service.version",
+		"service.instance.id",
+		"process.pid",
+		"process.command_line",
+		"telemetry.sdk.name",
+		"os.name",
+		"deployment.environment",
+	} {
+		if _, ok := keys[banned]; ok {
+			t.Fatalf("did not expect %q on per-log resource attrs", banned)
+		}
+	}
+	for _, required := range []string{"env", "version", "ddsource", "deployment.environment.name", attrKeyDatadogLogSource} {
+		if _, ok := keys[required]; !ok {
+			t.Fatalf("expected %q on per-log resource attrs", required)
+		}
+	}
+}
+
+func TestSkipResourceKeyOnLogRecords(t *testing.T) {
+	tests := []struct {
+		key  string
+		skip bool
+	}{
+		{"service.name", true},
+		{"process.pid", true},
+		{"telemetry.sdk.version", true},
+		{"os.name", true},
+		{"deployment.environment", true},
+		{"deployment.environment.name", false},
+		{"env", false},
+		{"k8s.pod.name", false},
+		{"host.name", true},
+	}
+	for _, tt := range tests {
+		if got := skipResourceKeyOnLogRecords(tt.key); got != tt.skip {
+			t.Errorf("skipResourceKeyOnLogRecords(%q) = %v, want %v", tt.key, got, tt.skip)
+		}
+	}
 }
 
 func recordAttrs(r slog.Record) map[string]string {

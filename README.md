@@ -27,7 +27,7 @@ Export failures for logs/metrics/traces are logged; the process keeps running wh
 | Variable | Purpose |
 |----------|---------|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint (e.g. ACA-injected `127.0.0.1:4317`). |
-| `OTEL_SERVICE_NAME` | Resource `service.name`, OTLP log bridge **scope name**, per-line **`service`** (Datadog Service facet), and **`service.name`** from flattened resource fields. |
+| `OTEL_SERVICE_NAME` | Resource `service.name`, OTLP log bridge **scope name**, and per-line flat **`service`** (Datadog Service facet). `service.*` is not duplicated on each log line. |
 | `OTEL_DEPLOYMENT_ENVIRONMENT` | Deployment env (resource + log field `env`). |
 | `OTEL_SERVICE_VERSION` | Resource `service.version`, OTLP log bridge **scope version**, and log field `version`. |
 
@@ -51,7 +51,7 @@ Used for OTLP resource enrichment only; see `setup.go` (`resourceAttrsFromEnv`):
 
 ## Datadog: services, logs, and APM hosts
 
-- **Unified tagging:** Traces, metrics, and logs share one OTLP **resource** (service, deployment, process, OS, optional K8s/cloud, `env`, `version`, `ddsource`, `datadog.log.source`, etc.). **Every log record** repeats those resource key/values as slog/OTLP log attributes so JSON and Datadog match trace resource tags ([semantic mapping](https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/)). A top-level **`service`** string (Datadog log standard attribute) is set on each record for the Log Explorer **Service** facet; **`service.name`** also comes from the resource. **`trace_id`** / **`span_id`** are added when the log context has an active span.
+- **Unified tagging:** Traces, metrics, and OTLP logs use the **full** OTLP **resource** (service.*, process.*, telemetry SDK, OS, deployment, optional K8s/cloud, `env`, `version`, `ddsource`, etc.). **Each log line** adds a flat **`service`** string (Service facet) plus **high-signal** resource fields only—`env`, `version`, `deployment.environment.name`, `ddsource`, `datadog.log.source`, cloud region, K8s/ACA/container tags from env, and anything from **`OTEL_RESOURCE_ATTRIBUTES`** (non-host). **`service.*`**, **`process.*`**, **`telemetry.*`**, **`os.*`**, and deprecated **`deployment.environment`** are **not** repeated on every line (avoids nested `service` JSON in Datadog, argv noise, and SDK clutter); those stay on the resource for correlation. **`trace_id`** / **`span_id`** are added when the log context has an active span ([semantic mapping](https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/)).
 - **APM / infra host:** This package does **not** set OTLP resource **`datadog.host.name`**. Datadog derives host from its agent, cloud metadata, or other ingest rules ([hostname mapping](https://docs.datadoghq.com/opentelemetry/mapping/hostname/)).
 - **`service.instance.id`:** Set from **`CONTAINER_APP_REPLICA_NAME`**, then **`POD_NAME`**, then **`os.Hostname()`**, in that order. Values that look like unexpanded placeholders (`$(VAR)` or `${VAR}`) are skipped so misconfigured hostnames or env vars are not exported to logs. If none apply, a random `instance-…` id is used.
 - **`OTEL_RESOURCE_ATTRIBUTES`:** Comma-separated `k=v` pairs merged into the OTLP resource. **Values** that **contain** unexpanded `$(VAR)` / `${…}` placeholders (anywhere in the string) are **dropped** for that pair. The same filter applies to optional K8s/ACA/cloud env vars (`CONTAINER_APP_NAME`, `CONTAINER_NAME`, regions, etc.).
