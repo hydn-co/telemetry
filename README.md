@@ -12,7 +12,7 @@ It also installs a correlated **`log/slog`** pipeline: JSON to stdout or stderr,
 
 1. **Validates** required `OTEL_*` env vars (panics if any are missing).
 2. Builds an OTLP **resource** (service, deployment, process, OS, optional K8s/ACA attributes). The resource **never** sets **host** semantic attributes (`host`, `host.*`, `datadog.host.name`); those keys are stripped from `OTEL_RESOURCE_ATTRIBUTES` if present.
-3. Installs **slog**: primary JSON sink (stdout by default, or `Options.PrimaryLogWriter`), optional `LOG_FILE`, correlation fields, OTLP log bridge.
+3. Installs **slog**: primary JSON sink (stdout by default, or `Options.PrimaryLogWriter`), optional `LOG_FILE`, correlation fields (including top-level **`service`** for Datadog), OTLP log bridge (`otelslog` scope name + version from `OTEL_SERVICE_*`).
 4. Registers global **MeterProvider** (OTLP metrics) and **TracerProvider** (OTLP traces).
 5. Returns an **idempotent** shutdown function—`defer` it on exit.
 
@@ -27,9 +27,9 @@ Export failures for logs/metrics/traces are logged; the process keeps running wh
 | Variable | Purpose |
 |----------|---------|
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint (e.g. ACA-injected `127.0.0.1:4317`). |
-| `OTEL_SERVICE_NAME` | Resource `service.name`, OTLP log bridge scope name, and per-line `service.name` + nested `service.name` log fields. |
+| `OTEL_SERVICE_NAME` | Resource `service.name`, OTLP log bridge **scope name**, per-line **`service`** (Datadog Service facet), and **`service.name`** from flattened resource fields. |
 | `OTEL_DEPLOYMENT_ENVIRONMENT` | Deployment env (resource + log field `env`). |
-| `OTEL_SERVICE_VERSION` | `service.version` and log field `version`. |
+| `OTEL_SERVICE_VERSION` | Resource `service.version`, OTLP log bridge **scope version**, and log field `version`. |
 
 ---
 
@@ -45,7 +45,7 @@ Export failures for logs/metrics/traces are logged; the process keeps running wh
 
 Used for OTLP resource enrichment only; see `setup.go` (`resourceAttrsFromEnv`):
 
-`OTEL_SERVICE_NAMESPACE`, `POD_NAME`, `POD_NAMESPACE`, `POD_UID`, `NODE_NAME`, `CONTAINER_NAME`, `CONTAINER_APP_NAME`, `CONTAINER_APP_REPLICA_NAME`, `CONTAINER_APP_REVISION`, `AWS_REGION`, `AZURE_REGION`, `GOOGLE_CLOUD_REGION`.
+`OTEL_SERVICE_NAMESPACE`, `POD_NAME`, `POD_NAMESPACE`, `POD_UID`, `NODE_NAME`, `CONTAINER_NAME`, `CONTAINER_APP_NAME`, `CONTAINER_APP_REPLICA_NAME`, `AWS_REGION`, `AZURE_REGION`, `GOOGLE_CLOUD_REGION`. (Azure also sets `CONTAINER_APP_REVISION` on ACA; this package does not map it to the OTLP resource yet.)
 
 ---
 
@@ -54,7 +54,7 @@ Used for OTLP resource enrichment only; see `setup.go` (`resourceAttrsFromEnv`):
 - **Unified tagging:** Traces, metrics, and logs share one OTLP **resource** (service, deployment, process, OS, optional K8s/cloud, `env`, `version`, `ddsource`, `datadog.log.source`, etc.). **Every log record** repeats those resource key/values as slog/OTLP log attributes so JSON and Datadog match trace resource tags ([semantic mapping](https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/)). A top-level **`service`** string (Datadog log standard attribute) is set on each record for the Log Explorer **Service** facet; **`service.name`** also comes from the resource. **`trace_id`** / **`span_id`** are added when the log context has an active span.
 - **APM / infra host:** This package does **not** set OTLP resource **`datadog.host.name`**. Datadog derives host from its agent, cloud metadata, or other ingest rules ([hostname mapping](https://docs.datadoghq.com/opentelemetry/mapping/hostname/)).
 - **`service.instance.id`:** Set from **`CONTAINER_APP_REPLICA_NAME`**, then **`POD_NAME`**, then **`os.Hostname()`**, in that order. Values that look like unexpanded placeholders (`$(VAR)` or `${VAR}`) are skipped so misconfigured hostnames or env vars are not exported to logs. If none apply, a random `instance-…` id is used.
-- **`OTEL_RESOURCE_ATTRIBUTES`:** Comma-separated `k=v` pairs merged into the OTLP resource. **Values** that look like unexpanded `$(…)` / `${…}` placeholders are **dropped** (so bad platform or copy-paste config does not attach `$(CONTAINER_APP_REPLICA_NAME)` to every log line). The same filter applies to optional K8s/ACA/cloud env vars (`CONTAINER_APP_NAME`, `CONTAINER_NAME`, regions, etc.).
+- **`OTEL_RESOURCE_ATTRIBUTES`:** Comma-separated `k=v` pairs merged into the OTLP resource. **Values** that **contain** unexpanded `$(VAR)` / `${…}` placeholders (anywhere in the string) are **dropped** for that pair. The same filter applies to optional K8s/ACA/cloud env vars (`CONTAINER_APP_NAME`, `CONTAINER_NAME`, regions, etc.).
 - **Deployment:** Many teams also set **`DD_SERVICE`**, **`DD_ENV`**, **`DD_VERSION`** in Container Apps / Kubernetes for ingest paths that read them; this package does not require them but they align with Datadog docs.
 
 ---

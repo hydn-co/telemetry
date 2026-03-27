@@ -2,6 +2,9 @@ name: CI
 
 on:
   workflow_dispatch:
+  schedule:
+    # Daily 06:00 UTC on default branch (catches upstream Go/module drift when there are no commits).
+    - cron: "0 6 * * *"
   push:
     branches:
       - main
