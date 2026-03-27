@@ -2,6 +2,14 @@
 // correlated default slog logger for services that send telemetry to a local collector,
 // typically Azure Container Apps managed OpenTelemetry → Datadog.
 //
+// Datadog-oriented behavior (see https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/):
+//   - OTLP resource carries service.name, service.version, deployment.environment.name, env, version,
+//     ddsource, datadog.log.source, and optional K8s/ACA attributes; host.* is never emitted.
+//   - Every log record adds standard-attribute "service" (string) for the Log Explorer Service facet,
+//     plus resource fields and trace_id/span_id (32/16 hex) when a span is active.
+//   - Container env DD_SERVICE, DD_ENV, DD_VERSION should match OTEL_*; this package does not read DD_*,
+//     but duplicate tagging on the resource from Bicep is fine.
+//
 // See the repository README for environment variables and usage. Callers should invoke [Setup] only when OTLP is
 // enabled for the process; this package does not read application-specific telemetry flags.
 //
@@ -16,6 +24,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -105,9 +114,11 @@ func requireOTELEnv() {
 const defaultDatadogLogSource = "go"
 
 // correlationHandler attaches the same OTLP resource attributes as slog fields on every
-// record (JSON + OTLP logs) so logs match traces/metrics. It adds a nested service.name
-// group for Datadog and trace_id/span_id when a span is active. Host-like keys are stripped
-// from user records (see datadog_host_strip.go); resource-derived attrs omit the host namespace.
+// record (JSON + OTLP logs) so logs match traces/metrics. It adds a top-level string field
+// "service" (Datadog standard attribute for the Service facet on JSON logs; see
+// https://docs.datadoghq.com/standard-attributes/?product=log+management) plus trace_id/span_id
+// when a span is active. Host-like keys are stripped from user records (see
+// datadog_host_strip.go); resource-derived attrs omit the host namespace.
 type correlationHandler struct {
 	next           slog.Handler
 	resourceAttrs  []slog.Attr
@@ -121,7 +132,9 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 	rec := recordStripForbiddenHostAttrs(r)
 	rec.AddAttrs(h.resourceAttrs...)
-	rec.AddAttrs(slog.Group("service", slog.String("name", h.serviceName)))
+	// Flat "service" (not nested service.name) so Datadog Log Management maps the Service facet
+	// for stdout/JSON and OTLP pipelines; service.name also comes from resource flattening.
+	rec.AddAttrs(slog.String("service", h.serviceName))
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
 		rec.AddAttrs(
 			slog.String("trace_id", span.SpanContext().TraceID().String()),
@@ -384,21 +397,22 @@ const (
 	envGCPRegion            = "GOOGLE_CLOUD_REGION"
 )
 
-// isUnexpandedSubstitution reports values that look like a shell/compose/ARM placeholder
-// that was never expanded (e.g. "$(CONTAINER_APP_REPLICA_NAME)"). Those must not be sent
-// as service.instance.id or k8s.pod.name.
+// shellOrComposePlaceholder matches "$(VAR)" / "$(VAR_NAME)" anywhere in a string (ACA / compose
+// copy-paste). bracePlaceholder matches "${...}" (unexpanded Bicep-style or env templates).
+var (
+	shellOrComposePlaceholder = regexp.MustCompile(`\$\([A-Za-z_][A-Za-z0-9_]*\)`)
+	bracePlaceholder          = regexp.MustCompile(`\$\{[^}]+\}`)
+)
+
+// isUnexpandedSubstitution reports values that contain shell/compose-style "$(VAR)" or "${...}"
+// that was never expanded (e.g. OTEL_RESOURCE_ATTRIBUTES copy-pasted from ACA docs). Matching
+// anywhere in the string catches "foo=$(CONTAINER_APP_REPLICA_NAME)" not only a fully-placeholder value.
 func isUnexpandedSubstitution(s string) bool {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return false
 	}
-	if strings.HasPrefix(s, "$(") && strings.Contains(s, ")") {
-		return true
-	}
-	if strings.HasPrefix(s, "${") && strings.Contains(s, "}") {
-		return true
-	}
-	return false
+	return shellOrComposePlaceholder.MatchString(s) || bracePlaceholder.MatchString(s)
 }
 
 func pickServiceInstanceID() string {
@@ -597,13 +611,13 @@ func newOTLPLogHandler(ctx context.Context, serviceName, version string, res *re
 	)
 	otellogglobal.SetLoggerProvider(lp)
 
-	// Use OTEL service name as the bridge logger scope name. Record-level service tagging
-	// (service.name + nested service.name) comes from correlationHandler; resource carries
-	// semconv service.* for OTLP.
+	// Scope name/version align with OTEL_SERVICE_NAME / OTEL_SERVICE_VERSION for unified
+	// tagging on OTLP logs. Per-record fields (service, service.name, env, trace_id, …)
+	// come from correlationHandler + resource.
 	handler := otelslog.NewHandler(
 		serviceName,
 		otelslog.WithLoggerProvider(lp),
-		otelslog.WithVersion(""),
+		otelslog.WithVersion(version),
 	)
 	return lp, handler, nil
 }

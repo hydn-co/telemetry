@@ -53,8 +53,8 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 	if attrs["service.name"] != "mesh-stream" {
 		t.Fatalf("expected service.name attr, got %q", attrs["service.name"])
 	}
-	if got := serviceGroupName(next.records[0]); got != "mesh-stream" {
-		t.Fatalf("expected service group name %q, got %q", "mesh-stream", got)
+	if attrs["service"] != "mesh-stream" {
+		t.Fatalf("expected standard service attr for Datadog facet, got %q", attrs["service"])
 	}
 	if attrs["env"] != "dev1" {
 		t.Fatalf("expected env attr, got %q", attrs["env"])
@@ -243,6 +243,8 @@ func TestIsUnexpandedSubstitution(t *testing.T) {
 		{"$(CONTAINER_APP_REPLICA_NAME)", true},
 		{"${CONTAINER_APP_REPLICA_NAME}", true},
 		{"  $(FOO)  ", true},
+		{"prefix=$(CONTAINER_APP_REPLICA_NAME)", true},
+		{"attr=${otelEnvironment}", true},
 		{"my-replica-0000001", false},
 		{"", false},
 		{"$(unclosed", false},
@@ -342,19 +344,3 @@ func recordAttrs(r slog.Record) map[string]string {
 	return attrs
 }
 
-func serviceGroupName(r slog.Record) string {
-	var out string
-	r.Attrs(func(a slog.Attr) bool {
-		if a.Key != "service" || a.Value.Kind() != slog.KindGroup {
-			return true
-		}
-		for _, ga := range a.Value.Group() {
-			if ga.Key == "name" {
-				out = ga.Value.String()
-				return false
-			}
-		}
-		return true
-	})
-	return out
-}
