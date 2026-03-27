@@ -9,8 +9,10 @@
 //     resource (env, version, ddsource, deployment.environment.name, cloud/K8s/container when set,
 //     OTEL_RESOURCE_ATTRIBUTES, …), and trace_id/span_id when a span is active.
 //   - service.*, process.*, telemetry.*, os.*, and deprecated deployment.environment are not copied
-//     onto every record (avoids nested "service" JSON, huge command lines, and SDK noise); they remain
-//     on the resource for traces/metrics/OTLP logs.
+//     onto every record (avoids nested "service" JSON, huge command lines, and SDK noise). The OTLP log
+//     LoggerProvider uses a resource with service.* stripped so Datadog does not merge them into a nested
+//     "service" object; traces and metrics still use the full resource. Flat per-record tags (service,
+//     version, env, …) come from correlationHandler.
 //   - Container env DD_SERVICE, DD_ENV, DD_VERSION should match OTEL_*; this package does not read DD_*,
 //     but duplicate tagging on the resource from Bicep is fine.
 //
@@ -520,7 +522,7 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 }
 
 // skipResourceKeyOnLogRecords reports resource keys we do not copy onto every log line. The full
-// resource remains on TracerProvider, MeterProvider, and LoggerProvider for OTLP export.
+// resource remains on TracerProvider and MeterProvider; OTLP logs use [resourceForOTLPLogs] only.
 //
 // Omitted: host.* (infra host billing), service.* (flat "service" string instead; avoids Datadog
 // nesting service.name/… into a JSON object that breaks the Service facet), process.* (pid, argv,
@@ -544,6 +546,23 @@ func skipResourceKeyOnLogRecords(k string) bool {
 	default:
 		return false
 	}
+}
+
+// resourceForOTLPLogs returns a copy of res without service.* attributes. Datadog's OTLP log
+// pipeline groups those keys into a nested "service" object that duplicates the flat "service"
+// string and clutters Log Explorer; traces and metrics keep the full resource on their providers.
+func resourceForOTLPLogs(res *resource.Resource) *resource.Resource {
+	if res == nil {
+		return nil
+	}
+	var kept []attribute.KeyValue
+	for _, kv := range res.Attributes() {
+		if strings.HasPrefix(string(kv.Key), "service.") {
+			continue
+		}
+		kept = append(kept, kv)
+	}
+	return resource.NewWithAttributes(res.SchemaURL(), kept...)
 }
 
 // isBlockedHostResourceAttributeKey reports OTLP resource keys we never emit: the entire
@@ -639,7 +658,7 @@ func newOTLPLogHandler(ctx context.Context, serviceName, version string, res *re
 
 	lp := sdklog.NewLoggerProvider(
 		sdklog.WithProcessor(sdklog.NewBatchProcessor(exp)),
-		sdklog.WithResource(res),
+		sdklog.WithResource(resourceForOTLPLogs(res)),
 	)
 	otellogglobal.SetLoggerProvider(lp)
 

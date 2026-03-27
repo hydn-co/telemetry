@@ -365,6 +365,29 @@ func TestResourceToSlogAttrsOmitsVerboseResourceNamespaces(t *testing.T) {
 	}
 }
 
+func TestResourceForOTLPLogsOmitsServiceNamespace(t *testing.T) {
+	t.Setenv(envServiceNamespace, "my-ns")
+	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
+	logRes := resourceForOTLPLogs(res)
+	for _, kv := range logRes.Attributes() {
+		k := string(kv.Key)
+		if strings.HasPrefix(k, "service.") {
+			t.Fatalf("OTLP log resource must not contain %q (Datadog nests service.* into a broken object)", k)
+		}
+	}
+	// Sanity: full resource still had service.name before stripping.
+	var sawName bool
+	for _, kv := range res.Attributes() {
+		if kv.Key == semconv.ServiceNameKey {
+			sawName = true
+			break
+		}
+	}
+	if !sawName {
+		t.Fatal("expected service.name on full telemetry resource")
+	}
+}
+
 func TestSkipResourceKeyOnLogRecords(t *testing.T) {
 	tests := []struct {
 		key  string
