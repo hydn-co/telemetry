@@ -9,9 +9,23 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 )
+
+// simulateSDKResourceMerge reproduces what sdklog.WithResource (and sdktrace/sdkmetric)
+// do internally: resource.Merge(resource.Environment(), userResource). This is the
+// merge that re-introduces raw OTEL_RESOURCE_ATTRIBUTES values the SDK parsed without
+// any placeholder detection.
+func simulateSDKResourceMerge(t *testing.T, userRes *resource.Resource) *resource.Resource {
+	t.Helper()
+	merged, err := resource.Merge(resource.Environment(), userRes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return merged
+}
 
 type captureHandler struct {
 	records []slog.Record
@@ -365,26 +379,59 @@ func TestResourceToSlogAttrsOmitsVerboseResourceNamespaces(t *testing.T) {
 	}
 }
 
-func TestResourceForOTLPLogsOmitsServiceNamespace(t *testing.T) {
-	t.Setenv(envServiceNamespace, "my-ns")
-	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
-	logRes := resourceForOTLPLogs(res)
-	for _, kv := range logRes.Attributes() {
-		k := string(kv.Key)
-		if strings.HasPrefix(k, "service.") {
-			t.Fatalf("OTLP log resource must not contain %q (Datadog nests service.* into a broken object)", k)
+// TestSDKMergeServiceInstanceIDOverridesEnvPlaceholder reproduces the exact bug:
+// ACA injects OTEL_RESOURCE_ATTRIBUTES with service.instance.id=$(CONTAINER_APP_REPLICA_NAME).
+// The OTel SDK's WithResource merges resource.Environment() (which includes this literal) with
+// the resource we provide. Our resource must carry the correct service.instance.id so it wins
+// the merge (b overrides a in resource.Merge).
+func TestSDKMergeServiceInstanceIDOverridesEnvPlaceholder(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES",
+		"service.instance.id=$(CONTAINER_APP_REPLICA_NAME),service.namespace=dev2acaenv,deployment.environment.name=dev2,service.version=1.0.0")
+	t.Setenv("OTEL_SERVICE_NAME", "mesh-stream")
+	t.Setenv(envContainerAppReplica, "$(CONTAINER_APP_REPLICA_NAME)")
+	t.Setenv(envPodName, "dev2meshstream--0000008-5cfcf66475-kztdt")
+
+	res := telemetryResource("mesh-stream", "dev2", "1.0.0")
+	merged := simulateSDKResourceMerge(t, res)
+
+	attrs := make(map[attribute.Key]string)
+	for _, kv := range merged.Attributes() {
+		if kv.Value.Type() == attribute.STRING {
+			attrs[kv.Key] = kv.Value.AsString()
 		}
 	}
-	// Sanity: full resource still had service.name before stripping.
-	var sawName bool
-	for _, kv := range res.Attributes() {
-		if kv.Key == semconv.ServiceNameKey {
-			sawName = true
-			break
+
+	if inst := attrs[semconv.ServiceInstanceIDKey]; isUnexpandedSubstitution(inst) {
+		t.Fatalf("after SDK merge, service.instance.id is a literal placeholder: %q", inst)
+	}
+	if inst := attrs[semconv.ServiceInstanceIDKey]; inst != "dev2meshstream--0000008-5cfcf66475-kztdt" {
+		t.Fatalf("service.instance.id = %q, want pod name", inst)
+	}
+	if svc := attrs[semconv.ServiceNameKey]; svc != "mesh-stream" {
+		t.Fatalf("service.name = %q, want mesh-stream", svc)
+	}
+}
+
+// TestSDKMergeAllProvidersConsistent verifies traces, metrics, and logs all get the same
+// correct service.instance.id after the SDK merge (the same resource is used for all three).
+func TestSDKMergeAllProvidersConsistent(t *testing.T) {
+	t.Setenv("OTEL_RESOURCE_ATTRIBUTES",
+		"service.instance.id=$(CONTAINER_APP_REPLICA_NAME)")
+	t.Setenv("OTEL_SERVICE_NAME", "mesh-stream")
+	t.Setenv(envContainerAppReplica, "$(CONTAINER_APP_REPLICA_NAME)")
+	t.Setenv(envPodName, "real-pod-name")
+
+	res := telemetryResource("mesh-stream", "dev1", "1.0.0")
+	merged := simulateSDKResourceMerge(t, res)
+
+	var inst string
+	for _, kv := range merged.Attributes() {
+		if kv.Key == semconv.ServiceInstanceIDKey {
+			inst = kv.Value.AsString()
 		}
 	}
-	if !sawName {
-		t.Fatal("expected service.name on full telemetry resource")
+	if inst != "real-pod-name" {
+		t.Fatalf("service.instance.id = %q, want real-pod-name", inst)
 	}
 }
 
