@@ -5,9 +5,10 @@
 // Datadog-oriented behavior (see https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/):
 //   - OTLP resource carries the full OpenTelemetry resource (service.*, process.*, telemetry.*, OS,
 //     deployment, optional K8s/ACA, etc.); host.* is never emitted.
-//   - Each log line adds a flat "service" string (Service facet), high-signal tags copied from the
-//     resource (env, version, ddsource, deployment.environment.name, cloud/K8s/container when set,
-//     OTEL_RESOURCE_ATTRIBUTES, …), and trace_id/span_id when a span is active.
+//   - Each log line adds a flat top-level "service" string (Service facet), strips conflicting
+//     top-level user-provided service/service.* and host/host.* attrs, copies high-signal tags
+//     from the resource (env, version, ddsource, deployment.environment.name, cloud/K8s/container
+//     when set, OTEL_RESOURCE_ATTRIBUTES, …), and adds trace_id/span_id when a span is active.
 //   - service.*, process.*, telemetry.*, os.*, and deprecated deployment.environment are not copied
 //     onto every slog record (avoids huge command lines and SDK noise on each JSON line). All three
 //     providers (trace, metric, log) use the same full OTLP resource so that our correct values
@@ -73,8 +74,9 @@ const EnvLogLevel = "LOG_LEVEL"
 
 // EnvOTELResourceAttributes is optional comma-separated key=value pairs merged into the
 // OTLP resource (e.g. set by Bicep alongside DD_* for Datadog unified tagging).
-// Keys in the OpenTelemetry host namespace (host, host.*) and datadog.host.name are
-// ignored so the SDK never emits host resource attributes.
+// Keys in the OpenTelemetry host namespace (host, host.*), datadog.host.name, and
+// service.name are sanitized out so this package stays authoritative for Datadog host
+// and service identity across SDK resource merges.
 const EnvOTELResourceAttributes = "OTEL_RESOURCE_ATTRIBUTES"
 
 // Options configures Setup. Other configuration remains on OTEL_* and LOG_FILE env vars.
@@ -122,11 +124,14 @@ const defaultDatadogLogSource = "go"
 
 // correlationHandler adds Datadog-oriented fields on every record: flat "service", a small set of
 // resource-derived tags from resourceToSlogAttrs (not the full resource), and trace_id/span_id when
-// a span is active. User records are stripped of host-like keys (datadog_host_strip.go).
+// a span is active. User records are stripped of reserved Datadog keys so callers cannot override
+// service mapping or host mapping (datadog_host_strip.go).
 type correlationHandler struct {
-	next           slog.Handler
-	resourceAttrs  []slog.Attr
-	serviceName    string
+	next          slog.Handler
+	resourceAttrs []slog.Attr
+	serviceName   string
+	scopedAttrs   []scopedSlogAttrs
+	groups        []string
 }
 
 func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -134,27 +139,37 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 }
 
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
-	rec := recordStripForbiddenHostAttrs(r)
-	rec.AddAttrs(h.resourceAttrs...)
+	scoped := cloneScopedSlogAttrs(h.scopedAttrs)
+	if attrs := recordReservedDatadogAttrs(h.groups, r); len(attrs) > 0 {
+		scoped = append(scoped, scopedSlogAttrs{groups: append([]string(nil), h.groups...), attrs: attrs})
+	}
+	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
+	out.AddAttrs(materializeScopedSlogAttrs(scoped)...)
+	out.AddAttrs(h.resourceAttrs...)
 	// Flat string "service" for Datadog Log Explorer Service facet. Do not duplicate service.*
 	// resource keys on the record (see resourceToSlogAttrs); Datadog nests them under "service"
 	// and breaks the facet.
-	rec.AddAttrs(slog.String("service", h.serviceName))
+	out.AddAttrs(slog.String("service", h.serviceName))
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
-		rec.AddAttrs(
+		out.AddAttrs(
 			slog.String("trace_id", span.SpanContext().TraceID().String()),
 			slog.String("span_id", span.SpanContext().SpanID().String()),
 		)
 	}
-	return h.next.Handle(ctx, rec)
+	return h.next.Handle(ctx, out)
 }
 
 func (h *correlationHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	return &correlationHandler{next: h.next.WithAttrs(attrs), resourceAttrs: h.resourceAttrs, serviceName: h.serviceName}
+	filtered := filterReservedDatadogLogAttrs(h.groups, attrs)
+	nextScoped := cloneScopedSlogAttrs(h.scopedAttrs)
+	if len(filtered) > 0 {
+		nextScoped = append(nextScoped, scopedSlogAttrs{groups: append([]string(nil), h.groups...), attrs: append([]slog.Attr(nil), filtered...)})
+	}
+	return &correlationHandler{next: h.next, resourceAttrs: h.resourceAttrs, serviceName: h.serviceName, scopedAttrs: nextScoped, groups: append([]string(nil), h.groups...)}
 }
 
 func (h *correlationHandler) WithGroup(name string) slog.Handler {
-	return &correlationHandler{next: h.next.WithGroup(name), resourceAttrs: h.resourceAttrs, serviceName: h.serviceName}
+	return &correlationHandler{next: h.next, resourceAttrs: h.resourceAttrs, serviceName: h.serviceName, scopedAttrs: cloneScopedSlogAttrs(h.scopedAttrs), groups: appendRawGroup(h.groups, name)}
 }
 
 // multiHandler forwards each log record to multiple handlers.
@@ -231,6 +246,7 @@ func (h *minLevelHandler) WithGroup(name string) slog.Handler {
 // and should be called on process exit.
 func Setup(ctx context.Context, opts Options) func() {
 	requireOTELEnv()
+	sanitizeAuthoritativeTelemetryEnvironment()
 
 	serviceName := os.Getenv(EnvOTELServiceName)
 	environment := os.Getenv(EnvOTELDeploymentEnvironment)
@@ -278,7 +294,7 @@ func Setup(ctx context.Context, opts Options) func() {
 		slog.Error("failed to create OTLP log exporter", "error", err)
 	} else if otelLogHandler != nil {
 		handlers = append(handlers, &minLevelHandler{
-			next:  &stripDatadogHostHandler{next: otelLogHandler},
+			next:  &stripReservedDatadogAttrsHandler{next: otelLogHandler},
 			level: logLevel,
 		})
 	}
@@ -389,18 +405,17 @@ const otelSDKVersion = "1.42.0"
 // Optional environment variables for resource attributes (K8s, ACA, cloud).
 // When set, the corresponding semconv attributes are added to the resource.
 const (
-	envServiceNamespace     = "OTEL_SERVICE_NAMESPACE"
-	envPodName              = "POD_NAME"
-	envPodNamespace         = "POD_NAMESPACE"
-	envPodUID               = "POD_UID"
-	envNodeName             = "NODE_NAME"
-	envContainerName        = "CONTAINER_NAME"
-	envContainerAppName     = "CONTAINER_APP_NAME"
-	envContainerAppReplica  = "CONTAINER_APP_REPLICA_NAME"
-	envContainerAppRevision = "CONTAINER_APP_REVISION"
-	envAWSRegion            = "AWS_REGION"
-	envAzureRegion          = "AZURE_REGION"
-	envGCPRegion            = "GOOGLE_CLOUD_REGION"
+	envServiceNamespace    = "OTEL_SERVICE_NAMESPACE"
+	envPodName             = "POD_NAME"
+	envPodNamespace        = "POD_NAMESPACE"
+	envPodUID              = "POD_UID"
+	envNodeName            = "NODE_NAME"
+	envContainerName       = "CONTAINER_NAME"
+	envContainerAppName    = "CONTAINER_APP_NAME"
+	envContainerAppReplica = "CONTAINER_APP_REPLICA_NAME"
+	envAWSRegion           = "AWS_REGION"
+	envAzureRegion         = "AZURE_REGION"
+	envGCPRegion           = "GOOGLE_CLOUD_REGION"
 )
 
 // shellOrComposePlaceholder matches "$(VAR)" / "$( VAR )" anywhere in a string (ACA / compose
@@ -528,14 +543,16 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 // the per-record slog attrs added by correlationHandler — verbose namespaces stay on the
 // OTLP resource and are not repeated on every JSON line.
 //
-// Omitted: host.* (infra host billing), service.* (flat "service" string instead),
+// Omitted: host.* (infra host billing), service and service.* (flat "service" string instead),
 // process.* (pid, argv, command line bloat), telemetry.* (SDK identity), os.*, and
 // deprecated deployment.environment (deployment.environment.name + env are kept).
 func skipResourceKeyOnLogRecords(k string) bool {
-	if isBlockedHostResourceAttributeKey(k) {
+	if isForbiddenDatadogHostResourceAttributeKey(k) {
 		return true
 	}
 	switch {
+	case k == "service":
+		return true
 	case strings.HasPrefix(k, "service."):
 		return true
 	case strings.HasPrefix(k, "process."):
@@ -551,19 +568,32 @@ func skipResourceKeyOnLogRecords(k string) bool {
 	}
 }
 
-// isBlockedHostResourceAttributeKey reports OTLP resource keys we never emit: the entire
-// host semantic convention namespace and Datadog host overrides.
-func isBlockedHostResourceAttributeKey(k string) bool {
-	if k == "host" || k == "datadog.host.name" {
+func isForbiddenDatadogHostResourceAttributeKey(k string) bool {
+	path := splitSlogPathComponent(k)
+	if len(path) == 0 {
+		return false
+	}
+	return isForbiddenDatadogHostAttrPath(path)
+}
+
+// isBlockedDatadogResourceAttributeEnvKey reports OTLP resource env keys we never accept
+// from OTEL_RESOURCE_ATTRIBUTES: host-like keys, bare service, and service.name so
+// OTEL_SERVICE_NAME remains authoritative.
+func isBlockedDatadogResourceAttributeEnvKey(k string) bool {
+	if isForbiddenDatadogHostResourceAttributeKey(k) {
 		return true
 	}
-	return strings.HasPrefix(k, "host.")
+	path := splitSlogPathComponent(k)
+	if len(path) == 1 && path[0] == "service" {
+		return true
+	}
+	return len(path) >= 2 && path[0] == "service" && path[1] == "name"
 }
 
 func stripHostResourceAttributes(attrs []attribute.KeyValue) []attribute.KeyValue {
 	var out []attribute.KeyValue
 	for _, a := range attrs {
-		if isBlockedHostResourceAttributeKey(string(a.Key)) {
+		if isForbiddenDatadogHostResourceAttributeKey(string(a.Key)) {
 			continue
 		}
 		out = append(out, a)
@@ -571,14 +601,17 @@ func stripHostResourceAttributes(attrs []attribute.KeyValue) []attribute.KeyValu
 	return out
 }
 
-// appendResourceAttributesFromEnv parses OTEL_RESOURCE_ATTRIBUTES (comma-separated k=v)
-// and appends string attributes. Duplicate keys are allowed; last writer wins in some
-// backends—call after base attrs so env can supplement Bicep-provided resource hints.
-func appendResourceAttributesFromEnv(attrs []attribute.KeyValue) []attribute.KeyValue {
-	raw := strings.TrimSpace(os.Getenv(EnvOTELResourceAttributes))
+type otelResourceAttributePair struct {
+	key   string
+	value string
+}
+
+func parseSanitizedOTELResourceAttributes(raw string) []otelResourceAttributePair {
+	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return attrs
+		return nil
 	}
+	var pairs []otelResourceAttributePair
 	for _, pair := range strings.Split(raw, ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
@@ -590,10 +623,40 @@ func appendResourceAttributesFromEnv(attrs []attribute.KeyValue) []attribute.Key
 		}
 		k := strings.TrimSpace(kv[0])
 		v := strings.TrimSpace(kv[1])
-		if k == "" || isBlockedHostResourceAttributeKey(k) || isUnexpandedSubstitution(v) {
+		if k == "" || isBlockedDatadogResourceAttributeEnvKey(k) || isUnexpandedSubstitution(v) {
 			continue
 		}
-		attrs = append(attrs, attribute.String(k, v))
+		pairs = append(pairs, otelResourceAttributePair{key: k, value: v})
+	}
+	return pairs
+}
+
+func sanitizeOTELResourceAttributes(raw string) string {
+	pairs := parseSanitizedOTELResourceAttributes(raw)
+	if len(pairs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(pairs))
+	for _, pair := range pairs {
+		parts = append(parts, pair.key+"="+pair.value)
+	}
+	return strings.Join(parts, ",")
+}
+
+func sanitizeAuthoritativeTelemetryEnvironment() {
+	sanitized := sanitizeOTELResourceAttributes(os.Getenv(EnvOTELResourceAttributes))
+	if sanitized == "" {
+		_ = os.Unsetenv(EnvOTELResourceAttributes)
+		return
+	}
+	_ = os.Setenv(EnvOTELResourceAttributes, sanitized)
+}
+
+// appendResourceAttributesFromEnv parses OTEL_RESOURCE_ATTRIBUTES (comma-separated k=v)
+// and appends string attributes after the authoritative-key filter has been applied.
+func appendResourceAttributesFromEnv(attrs []attribute.KeyValue) []attribute.KeyValue {
+	for _, pair := range parseSanitizedOTELResourceAttributes(os.Getenv(EnvOTELResourceAttributes)) {
+		attrs = append(attrs, attribute.String(pair.key, pair.value))
 	}
 	return attrs
 }

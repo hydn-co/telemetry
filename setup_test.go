@@ -219,6 +219,29 @@ func TestAppendResourceAttributesFromEnvStripsHostNamespace(t *testing.T) {
 	}
 }
 
+func TestAppendResourceAttributesFromEnvStripsReservedServiceKey(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "service={\"name\":\"wrong\"},keep=yes")
+	out := appendResourceAttributesFromEnv(nil)
+	if len(out) != 1 || string(out[0].Key) != "keep" || out[0].Value.AsString() != "yes" {
+		t.Fatalf("got %+v", out)
+	}
+}
+
+func TestAppendResourceAttributesFromEnvStripsServiceName(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "service.name=wrong-service,keep=yes")
+	out := appendResourceAttributesFromEnv(nil)
+	if len(out) != 1 || string(out[0].Key) != "keep" || out[0].Value.AsString() != "yes" {
+		t.Fatalf("got %+v", out)
+	}
+}
+
+func TestSanitizeOTELResourceAttributesStripsAuthoritativeKeys(t *testing.T) {
+	raw := ` host.name = bad , service.name = wrong-service , service={"name":"wrong"}, keep = yes `
+	if got := sanitizeOTELResourceAttributes(raw); got != "keep=yes" {
+		t.Fatalf("sanitizeOTELResourceAttributes() = %q, want %q", got, "keep=yes")
+	}
+}
+
 func TestAppendResourceAttributesFromEnvSkipsUnexpandedPlaceholderValues(t *testing.T) {
 	t.Setenv(EnvOTELResourceAttributes, "k8s.pod.name=$(CONTAINER_APP_REPLICA_NAME),foo=bar,other=${VAR}")
 	out := appendResourceAttributesFromEnv(nil)
@@ -359,6 +382,7 @@ func TestResourceToSlogAttrsOmitsVerboseResourceNamespaces(t *testing.T) {
 		keys[a.Key] = struct{}{}
 	}
 	for _, banned := range []string{
+		"service",
 		"service.name",
 		"service.version",
 		"service.instance.id",
@@ -435,11 +459,47 @@ func TestSDKMergeAllProvidersConsistent(t *testing.T) {
 	}
 }
 
+func TestSDKMergeSanitizedEnvRemovesHostNamespace(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "host.name=bad-host,host.arch=amd64,keep=yes")
+	sanitizeAuthoritativeTelemetryEnvironment()
+	res := telemetryResource("mesh-stream", "dev1", "1.0.0")
+	merged := simulateSDKResourceMerge(t, res)
+
+	for _, kv := range merged.Attributes() {
+		k := string(kv.Key)
+		if k == "host" || k == "hostname" || strings.HasPrefix(k, "host.") || k == "datadog.host.name" {
+			t.Fatalf("expected sanitized SDK merge to omit host attrs, got %q", k)
+		}
+	}
+}
+
+func TestSDKMergeSanitizedEnvKeepsServiceNameAuthoritative(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "service.name=wrong-service,keep=yes")
+	t.Setenv(EnvOTELServiceName, "mesh-stream")
+	sanitizeAuthoritativeTelemetryEnvironment()
+	res := telemetryResource("mesh-stream", "dev1", "1.0.0")
+	merged := simulateSDKResourceMerge(t, res)
+
+	attrs := make(map[attribute.Key]string)
+	for _, kv := range merged.Attributes() {
+		if kv.Value.Type() == attribute.STRING {
+			attrs[kv.Key] = kv.Value.AsString()
+		}
+	}
+	if svc := attrs[semconv.ServiceNameKey]; svc != "mesh-stream" {
+		t.Fatalf("service.name = %q, want mesh-stream", svc)
+	}
+	if keep := attrs[attribute.Key("keep")]; keep != "yes" {
+		t.Fatalf("keep = %q, want yes", keep)
+	}
+}
+
 func TestSkipResourceKeyOnLogRecords(t *testing.T) {
 	tests := []struct {
 		key  string
 		skip bool
 	}{
+		{"service", true},
 		{"service.name", true},
 		{"process.pid", true},
 		{"telemetry.sdk.version", true},
@@ -465,4 +525,3 @@ func recordAttrs(r slog.Record) map[string]string {
 	})
 	return attrs
 }
-
