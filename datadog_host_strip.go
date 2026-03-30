@@ -138,7 +138,7 @@ func filterReservedDatadogLogAttrs(groups []string, attrs []slog.Attr) []slog.At
 			out = append(out, slog.Attr{Key: a.Key, Value: slog.GroupValue(inner...)})
 			continue
 		}
-		out = append(out, slog.Attr{Key: a.Key, Value: a.Value})
+		out = append(out, slog.Attr{Key: a.Key, Value: normalizeSlogValue(a.Value)})
 	}
 	return out
 }

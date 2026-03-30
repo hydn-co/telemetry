@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func TestRecordStripForbiddenHostAttrs(t *testing.T) {
@@ -115,6 +117,86 @@ func TestCorrelationHandlerStripsConflictingServiceAttrs(t *testing.T) {
 	}
 	if attrs["k"] != "v" {
 		t.Fatalf("expected k=v, got %q", attrs["k"])
+	}
+}
+
+func TestCorrelationHandlerNormalizesUUIDAttrToString(t *testing.T) {
+	next := &captureHandler{}
+	logger := slog.New(&correlationHandler{
+		next:          next,
+		resourceAttrs: nil,
+		serviceName:   "svc",
+	})
+	id := uuid.MustParse("01234567-89ab-cdef-0123-456789abcdef")
+
+	logger.Info("hi", "id", id)
+
+	if len(next.records) != 1 {
+		t.Fatalf("got %d records", len(next.records))
+	}
+
+	var got slog.Attr
+	next.records[0].Attrs(func(a slog.Attr) bool {
+		if a.Key == "id" {
+			got = a
+			return false
+		}
+		return true
+	})
+	if got.Key == "" {
+		t.Fatal("expected id attr")
+	}
+	if got.Value.Kind() != slog.KindString {
+		t.Fatalf("expected id attr to be string, got %v", got.Value.Kind())
+	}
+	if got.Value.String() != id.String() {
+		t.Fatalf("expected id %q, got %q", id.String(), got.Value.String())
+	}
+}
+
+func TestCorrelationHandlerNormalizesUUIDsInsideMapsAndSlices(t *testing.T) {
+	next := &captureHandler{}
+	logger := slog.New(&correlationHandler{
+		next:          next,
+		resourceAttrs: nil,
+		serviceName:   "svc",
+	})
+	id := uuid.MustParse("01234567-89ab-cdef-0123-456789abcdef")
+	payload := map[string]any{
+		"id":  id,
+		"ids": []uuid.UUID{id},
+	}
+
+	logger.Info("hi", "payload", payload)
+
+	if len(next.records) != 1 {
+		t.Fatalf("got %d records", len(next.records))
+	}
+
+	var got slog.Attr
+	next.records[0].Attrs(func(a slog.Attr) bool {
+		if a.Key == "payload" {
+			got = a
+			return false
+		}
+		return true
+	})
+	if got.Key == "" {
+		t.Fatal("expected payload attr")
+	}
+	payloadValue, ok := got.Value.Any().(map[string]any)
+	if !ok {
+		t.Fatalf("expected normalized payload map, got %T", got.Value.Any())
+	}
+	if payloadValue["id"] != id.String() {
+		t.Fatalf("expected payload id %q, got %#v", id.String(), payloadValue["id"])
+	}
+	ids, ok := payloadValue["ids"].([]any)
+	if !ok {
+		t.Fatalf("expected normalized ids slice, got %T", payloadValue["ids"])
+	}
+	if len(ids) != 1 || ids[0] != id.String() {
+		t.Fatalf("expected ids [%q], got %#v", id.String(), ids)
 	}
 }
 
