@@ -93,7 +93,7 @@ Use **`slog.InfoContext` / `slog.ErrorContext`** (and an instrumented HTTP stack
 
 ## Verification
 
-After startup, at **debug** level, look for `telemetry initialized` with `otlp_logs_enabled` and `otlp_metrics_enabled`. Ensure your ACA environment sends **logs**, **traces**, and **metrics** to Datadog when you expect all three.
+After startup, at **debug** level, look for `telemetry initialized` and verify `otlp_logs_enabled`, `otlp_metrics_enabled`, and `otlp_traces_enabled`. That startup event now includes a `resource` group with the effective `service_name`, `service_namespace` when present, `service_version`, `service_instance_id`, and `deployment_environment_name`, which is the fastest way to confirm what this process is putting on the OTLP resource before any collector or backend remaps it. Ensure your ACA environment sends **logs**, **traces**, and **metrics** to Datadog when you expect all three.
 
 ---
 

@@ -307,18 +307,13 @@ func Setup(ctx context.Context, opts Options) func() {
 	if primaryOut == os.Stderr {
 		primaryDesc = "stderr"
 	}
-	slog.Debug("telemetry initialized",
-		"primary_log", primaryDesc,
-		"log_file", logPath,
-		"otlp_logs_enabled", logProvider != nil,
-		"otlp_metrics_enabled", metricProvider != nil,
-	)
 
 	// OTLP tracing (best-effort; logging already works).
 	// WithInsecure() is used for plain gRPC to the ACA-managed OTLP endpoint (e.g. 127.0.0.1:4317).
 	exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure())
 	if err != nil {
 		slog.Error("failed to create OTLP trace exporter", slog.String("error", err.Error()))
+		logTelemetryInitialized(primaryDesc, logPath, logProvider != nil, metricProvider != nil, false, res)
 		return makeShutdownFunc(nil, logProvider, metricProvider, logFile, serviceName, version, environment)
 	}
 
@@ -327,6 +322,7 @@ func Setup(ctx context.Context, opts Options) func() {
 		sdktrace.WithResource(res),
 	)
 	otel.SetTracerProvider(tp)
+	logTelemetryInitialized(primaryDesc, logPath, logProvider != nil, metricProvider != nil, true, res)
 
 	return makeShutdownFunc(tp, logProvider, metricProvider, logFile, serviceName, version, environment)
 }
@@ -342,6 +338,59 @@ func newLogger(handlers []slog.Handler, res *resource.Resource, serviceName stri
 		serviceName:   serviceName,
 	}
 	return slog.New(handler)
+}
+
+func logTelemetryInitialized(primaryDesc, logPath string, logsEnabled, metricsEnabled, tracesEnabled bool, res *resource.Resource) {
+	args := []any{
+		"primary_log", primaryDesc,
+		"log_file", logPath,
+		"otlp_logs_enabled", logsEnabled,
+		"otlp_metrics_enabled", metricsEnabled,
+		"otlp_traces_enabled", tracesEnabled,
+	}
+	if resourceAttr := resourceStartupDiagnosticsAttr(res); resourceAttr.Key != "" {
+		args = append(args, resourceAttr)
+	}
+	slog.Debug("telemetry initialized", args...)
+}
+
+func resourceStartupDiagnosticsAttr(res *resource.Resource) slog.Attr {
+	if res == nil {
+		return slog.Attr{}
+	}
+	attrs := make([]slog.Attr, 0, 6)
+	appendAttr := func(key, value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		attrs = append(attrs, slog.String(key, value))
+	}
+	appendAttr("service_name", resourceStringAttr(res, semconv.ServiceNameKey))
+	appendAttr("service_namespace", resourceStringAttr(res, semconv.ServiceNamespaceKey))
+	appendAttr("service_version", resourceStringAttr(res, semconv.ServiceVersionKey))
+	appendAttr("service_instance_id", resourceStringAttr(res, semconv.ServiceInstanceIDKey))
+	appendAttr("deployment_environment_name", resourceStringAttr(res, attribute.Key("deployment.environment.name")))
+	appendAttr("k8s_pod_name", resourceStringAttr(res, semconv.K8SPodNameKey))
+	if len(attrs) == 0 {
+		return slog.Attr{}
+	}
+	return slog.Attr{Key: "resource", Value: slog.GroupValue(attrs...)}
+}
+
+func resourceStringAttr(res *resource.Resource, key attribute.Key) string {
+	if res == nil {
+		return ""
+	}
+	for _, kv := range res.Attributes() {
+		if kv.Key != key {
+			continue
+		}
+		if kv.Value.Type() == attribute.STRING {
+			return kv.Value.AsString()
+		}
+		return kv.Value.Emit()
+	}
+	return ""
 }
 
 // resourceToSlogAttrs converts a subset of the OTLP resource into per-log slog attributes for

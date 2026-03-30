@@ -1,7 +1,9 @@
 package telemetry
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"testing"
@@ -403,6 +405,73 @@ func TestResourceToSlogAttrsOmitsVerboseResourceNamespaces(t *testing.T) {
 	}
 }
 
+func TestResourceStartupDiagnosticsAttrIncludesMergedServiceIdentity(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes,
+		"service.instance.id=$(CONTAINER_APP_REPLICA_NAME),service.namespace=dev2acaenv4cqolh5yc662y,deployment.environment.name=dev2,service.version=0.1.0-alpha.142")
+	t.Setenv(EnvOTELServiceName, "mesh-stream")
+	t.Setenv(envContainerAppReplica, "$(CONTAINER_APP_REPLICA_NAME)")
+	t.Setenv(envPodName, "dev2meshstream4cqolh5yc662y--0000009-5fbd9cc69-5fbfj")
+
+	res := telemetryResource("mesh-stream", "dev2", "0.1.0-alpha.142")
+	merged := simulateSDKResourceMerge(t, res)
+	diag := resourceStartupDiagnosticsAttr(merged)
+	if diag.Key != "resource" {
+		t.Fatalf("expected resource group, got %q", diag.Key)
+	}
+	got := groupAttrs(diag)
+	if got["service_name"] != "mesh-stream" {
+		t.Fatalf("service_name = %q, want mesh-stream", got["service_name"])
+	}
+	if got["service_namespace"] != "dev2acaenv4cqolh5yc662y" {
+		t.Fatalf("service_namespace = %q", got["service_namespace"])
+	}
+	if got["service_version"] != "0.1.0-alpha.142" {
+		t.Fatalf("service_version = %q", got["service_version"])
+	}
+	if got["service_instance_id"] != "dev2meshstream4cqolh5yc662y--0000009-5fbd9cc69-5fbfj" {
+		t.Fatalf("service_instance_id = %q", got["service_instance_id"])
+	}
+	if got["deployment_environment_name"] != "dev2" {
+		t.Fatalf("deployment_environment_name = %q", got["deployment_environment_name"])
+	}
+	if got["k8s_pod_name"] != "dev2meshstream4cqolh5yc662y--0000009-5fbd9cc69-5fbfj" {
+		t.Fatalf("k8s_pod_name = %q", got["k8s_pod_name"])
+	}
+}
+
+func TestLogTelemetryInitializedIncludesTraceStatusAndResourceIdentity(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+	})
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
+	logTelemetryInitialized("stderr", "/tmp/app.log", true, true, true, res)
+
+	var obj map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &obj); err != nil {
+		t.Fatal(err)
+	}
+	if obj["otlp_traces_enabled"] != true {
+		t.Fatalf("expected otlp_traces_enabled=true, got %#v", obj["otlp_traces_enabled"])
+	}
+	resourceObj, ok := obj["resource"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected resource group, got %#v", obj["resource"])
+	}
+	if resourceObj["service_name"] != "mesh-stream" {
+		t.Fatalf("expected resource.service_name mesh-stream, got %#v", resourceObj["service_name"])
+	}
+	if resourceObj["service_version"] != "1.2.3" {
+		t.Fatalf("expected resource.service_version 1.2.3, got %#v", resourceObj["service_version"])
+	}
+	if resourceObj["deployment_environment_name"] != "dev1" {
+		t.Fatalf("expected resource.deployment_environment_name dev1, got %#v", resourceObj["deployment_environment_name"])
+	}
+}
+
 // TestSDKMergeServiceInstanceIDOverridesEnvPlaceholder reproduces the exact bug:
 // ACA injects OTEL_RESOURCE_ATTRIBUTES with service.instance.id=$(CONTAINER_APP_REPLICA_NAME).
 // The OTel SDK's WithResource merges resource.Environment() (which includes this literal) with
@@ -523,5 +592,13 @@ func recordAttrs(r slog.Record) map[string]string {
 		attrs[a.Key] = a.Value.String()
 		return true
 	})
+	return attrs
+}
+
+func groupAttrs(a slog.Attr) map[string]string {
+	attrs := make(map[string]string)
+	for _, inner := range a.Value.Group() {
+		attrs[inner.Key] = inner.Value.String()
+	}
 	return attrs
 }
