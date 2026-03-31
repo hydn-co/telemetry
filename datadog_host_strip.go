@@ -42,11 +42,55 @@ func isForbiddenDatadogHostAttrPath(path []string) bool {
 	return len(path) >= 3 && path[0] == "datadog" && path[1] == "host" && path[2] == "name"
 }
 
-func isReservedDatadogLogAttrPath(path []string) bool {
-	if isForbiddenDatadogHostAttrPath(path) {
+// isDatadogUnifiedTagPath reports reserved dd.service / dd.env / dd.version paths (flat or nested).
+func isDatadogUnifiedTagPath(path []string) bool {
+	if len(path) < 2 || path[0] != "dd" {
+		return false
+	}
+	switch path[1] {
+	case "service", "env", "version":
+		return true
+	default:
+		return false
+	}
+}
+
+// shouldStripDatadogUnifiedTagAttr removes user-supplied dd.* unified tags; preserves them
+// on the OTLP bridge path after correlationHandler (same rules as flat "service").
+func shouldStripDatadogUnifiedTagAttr(path []string, v slog.Value, preserveAuthoritativeForOTLP bool) bool {
+	if !isDatadogUnifiedTagPath(path) {
+		return false
+	}
+	if v.Kind() == slog.KindGroup {
 		return true
 	}
-	return len(path) > 0 && path[0] == "service"
+	if preserveAuthoritativeForOTLP {
+		return false
+	}
+	return true
+}
+
+// shouldStripServiceAttr reports whether a slog attribute under path should be removed.
+// When preserveFlatServiceString is true (OTLP bridge path, after correlationHandler), a
+// top-level string attribute "service" is kept so Datadog Log Explorer can populate the
+// Service facet from OTLP log attributes; Azure ACA → Datadog does not always map
+// resource service.name to that facet. User-supplied service (correlation input,
+// strip handler WithAttrs) uses preserveFlatServiceString=false so callers cannot override.
+func shouldStripServiceAttr(path []string, v slog.Value, preserveFlatServiceString bool) bool {
+	if len(path) == 0 || path[0] != "service" {
+		return false
+	}
+	if len(path) >= 2 {
+		return true
+	}
+	// Top-level key "service"
+	if v.Kind() == slog.KindGroup {
+		return true
+	}
+	if preserveFlatServiceString {
+		return false
+	}
+	return true
 }
 
 func appendRawGroup(groups []string, name string) []string {
@@ -122,16 +166,25 @@ func datadogHostStripReplaceAttr(groups []string, a slog.Attr) slog.Attr {
 
 // filterReservedDatadogLogAttrs returns a copy of attrs without reserved Datadog
 // top-level host/service namespaces, recursively for [slog.KindGroup].
-func filterReservedDatadogLogAttrs(groups []string, attrs []slog.Attr) []slog.Attr {
+// When preserveFlatServiceString is true, authoritative top-level "service" and
+// dd.service / dd.env / dd.version (from correlationHandler) are kept for OTLP export;
+// user contexts pass false.
+func filterReservedDatadogLogAttrs(groups []string, attrs []slog.Attr, preserveFlatServiceString bool) []slog.Attr {
 	var out []slog.Attr
 	for _, a := range attrs {
 		a.Value = a.Value.Resolve()
 		path := appendSlogPath(groups, a.Key)
-		if isReservedDatadogLogAttrPath(path) {
+		if isForbiddenDatadogHostAttrPath(path) {
+			continue
+		}
+		if shouldStripDatadogUnifiedTagAttr(path, a.Value, preserveFlatServiceString) {
+			continue
+		}
+		if shouldStripServiceAttr(path, a.Value, preserveFlatServiceString) {
 			continue
 		}
 		if a.Value.Kind() == slog.KindGroup {
-			inner := filterReservedDatadogLogAttrs(appendRawGroup(groups, a.Key), a.Value.Group())
+			inner := filterReservedDatadogLogAttrs(appendRawGroup(groups, a.Key), a.Value.Group(), preserveFlatServiceString)
 			if len(inner) == 0 {
 				continue
 			}
@@ -144,19 +197,20 @@ func filterReservedDatadogLogAttrs(groups []string, attrs []slog.Attr) []slog.At
 }
 
 // recordReservedDatadogAttrs returns the filtered attrs from r using the current slog
-// group path for top-level Datadog authority checks.
-func recordReservedDatadogAttrs(groups []string, r slog.Record) []slog.Attr {
+// group path for top-level Datadog authority checks. User records must pass
+// preserveFlatServiceString=false so callers cannot override service via slog.
+func recordReservedDatadogAttrs(groups []string, r slog.Record, preserveFlatServiceString bool) []slog.Attr {
 	var attrs []slog.Attr
 	r.Attrs(func(a slog.Attr) bool {
 		attrs = append(attrs, a)
 		return true
 	})
-	return filterReservedDatadogLogAttrs(groups, attrs)
+	return filterReservedDatadogLogAttrs(groups, attrs, preserveFlatServiceString)
 }
 
 func recordStripReservedDatadogAttrs(groups []string, r slog.Record) slog.Record {
 	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
-	out.AddAttrs(materializeScopedSlogAttrs([]scopedSlogAttrs{{groups: append([]string(nil), groups...), attrs: recordReservedDatadogAttrs(groups, r)}})...)
+	out.AddAttrs(materializeScopedSlogAttrs([]scopedSlogAttrs{{groups: append([]string(nil), groups...), attrs: recordReservedDatadogAttrs(groups, r, false)}})...)
 	return out
 }
 
@@ -175,7 +229,7 @@ func (h *stripReservedDatadogAttrsHandler) Enabled(ctx context.Context, level sl
 
 func (h *stripReservedDatadogAttrsHandler) Handle(ctx context.Context, r slog.Record) error {
 	scoped := cloneScopedSlogAttrs(h.scopedAttrs)
-	if attrs := recordReservedDatadogAttrs(h.groups, r); len(attrs) > 0 {
+	if attrs := recordReservedDatadogAttrs(h.groups, r, true); len(attrs) > 0 {
 		scoped = append(scoped, scopedSlogAttrs{groups: append([]string(nil), h.groups...), attrs: attrs})
 	}
 	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
@@ -184,7 +238,7 @@ func (h *stripReservedDatadogAttrsHandler) Handle(ctx context.Context, r slog.Re
 }
 
 func (h *stripReservedDatadogAttrsHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	filtered := filterReservedDatadogLogAttrs(h.groups, attrs)
+	filtered := filterReservedDatadogLogAttrs(h.groups, attrs, false)
 	nextScoped := cloneScopedSlogAttrs(h.scopedAttrs)
 	if len(filtered) > 0 {
 		nextScoped = append(nextScoped, scopedSlogAttrs{groups: append([]string(nil), h.groups...), attrs: append([]slog.Attr(nil), filtered...)})

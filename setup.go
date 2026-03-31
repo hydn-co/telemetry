@@ -5,8 +5,9 @@
 // Datadog-oriented behavior (see https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/):
 //   - OTLP resource carries the full OpenTelemetry resource (service.*, process.*, telemetry.*, OS,
 //     deployment, optional K8s/ACA, etc.); host.* is never emitted.
-//   - Each log line adds a flat top-level "service" string (Service facet), strips conflicting
-//     top-level user-provided service/service.* and host/host.* attrs, copies high-signal tags
+//   - Each log line adds flat top-level "service" plus dd.service, dd.env, dd.version for
+//     Datadog log pipeline remappers / facets; strips conflicting user service/service.*,
+//     dd.service/dd.env/dd.version, and host/host.* attrs; copies high-signal tags
 //     from the resource (env, version, ddsource, deployment.environment.name, cloud/K8s/container
 //     when set, OTEL_RESOURCE_ATTRIBUTES, …), and adds trace_id/span_id when a span is active.
 //   - service.*, process.*, telemetry.*, os.*, and deprecated deployment.environment are not copied
@@ -127,11 +128,13 @@ const defaultDatadogLogSource = "go"
 // a span is active. User records are stripped of reserved Datadog keys so callers cannot override
 // service mapping or host mapping (datadog_host_strip.go).
 type correlationHandler struct {
-	next          slog.Handler
-	resourceAttrs []slog.Attr
-	serviceName   string
-	scopedAttrs   []scopedSlogAttrs
-	groups        []string
+	next                   slog.Handler
+	resourceAttrs          []slog.Attr
+	serviceName            string
+	deploymentEnvironment  string
+	serviceVersion         string
+	scopedAttrs            []scopedSlogAttrs
+	groups                 []string
 }
 
 func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool {
@@ -140,16 +143,20 @@ func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool
 
 func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 	scoped := cloneScopedSlogAttrs(h.scopedAttrs)
-	if attrs := recordReservedDatadogAttrs(h.groups, r); len(attrs) > 0 {
+	if attrs := recordReservedDatadogAttrs(h.groups, r, false); len(attrs) > 0 {
 		scoped = append(scoped, scopedSlogAttrs{groups: append([]string(nil), h.groups...), attrs: attrs})
 	}
 	out := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
 	out.AddAttrs(materializeScopedSlogAttrs(scoped)...)
 	out.AddAttrs(h.resourceAttrs...)
-	// Flat string "service" for Datadog Log Explorer Service facet. Do not duplicate service.*
-	// resource keys on the record (see resourceToSlogAttrs); Datadog nests them under "service"
-	// and breaks the facet.
-	out.AddAttrs(slog.String("service", h.serviceName))
+	// Flat "service" and dd.* unified tags for Log Explorer and pipeline remappers. Do not
+	// duplicate service.* resource keys on the record (see resourceToSlogAttrs).
+	out.AddAttrs(
+		slog.String("service", h.serviceName),
+		slog.String("dd.service", h.serviceName),
+		slog.String("dd.env", h.deploymentEnvironment),
+		slog.String("dd.version", h.serviceVersion),
+	)
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
 		out.AddAttrs(
 			slog.String("trace_id", span.SpanContext().TraceID().String()),
@@ -160,16 +167,24 @@ func (h *correlationHandler) Handle(ctx context.Context, r slog.Record) error {
 }
 
 func (h *correlationHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	filtered := filterReservedDatadogLogAttrs(h.groups, attrs)
+	filtered := filterReservedDatadogLogAttrs(h.groups, attrs, false)
 	nextScoped := cloneScopedSlogAttrs(h.scopedAttrs)
 	if len(filtered) > 0 {
 		nextScoped = append(nextScoped, scopedSlogAttrs{groups: append([]string(nil), h.groups...), attrs: append([]slog.Attr(nil), filtered...)})
 	}
-	return &correlationHandler{next: h.next, resourceAttrs: h.resourceAttrs, serviceName: h.serviceName, scopedAttrs: nextScoped, groups: append([]string(nil), h.groups...)}
+	return &correlationHandler{
+		next: h.next, resourceAttrs: h.resourceAttrs, serviceName: h.serviceName,
+		deploymentEnvironment: h.deploymentEnvironment, serviceVersion: h.serviceVersion,
+		scopedAttrs: nextScoped, groups: append([]string(nil), h.groups...),
+	}
 }
 
 func (h *correlationHandler) WithGroup(name string) slog.Handler {
-	return &correlationHandler{next: h.next, resourceAttrs: h.resourceAttrs, serviceName: h.serviceName, scopedAttrs: cloneScopedSlogAttrs(h.scopedAttrs), groups: appendRawGroup(h.groups, name)}
+	return &correlationHandler{
+		next: h.next, resourceAttrs: h.resourceAttrs, serviceName: h.serviceName,
+		deploymentEnvironment: h.deploymentEnvironment, serviceVersion: h.serviceVersion,
+		scopedAttrs: cloneScopedSlogAttrs(h.scopedAttrs), groups: appendRawGroup(h.groups, name),
+	}
 }
 
 // multiHandler forwards each log record to multiple handlers.
@@ -284,7 +299,7 @@ func Setup(ctx context.Context, opts Options) func() {
 			handlers = append(handlers, fileHandler)
 		}
 	}
-	slog.SetDefault(newLogger(handlers, res, serviceName))
+	slog.SetDefault(newLogger(handlers, res, serviceName, environment, version))
 	if logFileErr != nil {
 		slog.Error("telemetry: failed to open log file for Datadog tailing", "path", logPath, "error", logFileErr)
 	}
@@ -302,7 +317,7 @@ func Setup(ctx context.Context, opts Options) func() {
 	if err != nil {
 		slog.Error("failed to create OTLP metric exporter", "error", err)
 	}
-	slog.SetDefault(newLogger(handlers, res, serviceName))
+	slog.SetDefault(newLogger(handlers, res, serviceName, environment, version))
 	primaryDesc := "stdout"
 	if primaryOut == os.Stderr {
 		primaryDesc = "stderr"
@@ -327,15 +342,17 @@ func Setup(ctx context.Context, opts Options) func() {
 	return makeShutdownFunc(tp, logProvider, metricProvider, logFile, serviceName, version, environment)
 }
 
-func newLogger(handlers []slog.Handler, res *resource.Resource, serviceName string) *slog.Logger {
+func newLogger(handlers []slog.Handler, res *resource.Resource, serviceName, deploymentEnvironment, serviceVersion string) *slog.Logger {
 	var handler slog.Handler = handlers[0]
 	if len(handlers) > 1 {
 		handler = &multiHandler{handlers: handlers}
 	}
 	handler = &correlationHandler{
-		next:          handler,
-		resourceAttrs: resourceToSlogAttrs(res),
-		serviceName:   serviceName,
+		next:                  handler,
+		resourceAttrs:         resourceToSlogAttrs(res),
+		serviceName:           serviceName,
+		deploymentEnvironment: deploymentEnvironment,
+		serviceVersion:        serviceVersion,
 	}
 	return slog.New(handler)
 }

@@ -54,9 +54,11 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:          next,
-		resourceAttrs: resourceToSlogAttrs(res),
-		serviceName:   "mesh-stream",
+		next:                  next,
+		resourceAttrs:         resourceToSlogAttrs(res),
+		serviceName:           "mesh-stream",
+		deploymentEnvironment: "dev1",
+		serviceVersion:        "1.2.3",
 	})
 
 	logger.Info("hello")
@@ -71,6 +73,10 @@ func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
 	}
 	if attrs["service"] != "mesh-stream" {
 		t.Fatalf("expected standard service attr for Datadog facet, got %q", attrs["service"])
+	}
+	if attrs["dd.service"] != "mesh-stream" || attrs["dd.env"] != "dev1" || attrs["dd.version"] != "1.2.3" {
+		t.Fatalf("expected dd.service/dd.env/dd.version for pipeline remappers, got dd.service=%q dd.env=%q dd.version=%q",
+			attrs["dd.service"], attrs["dd.env"], attrs["dd.version"])
 	}
 	if attrs["env"] != "dev1" {
 		t.Fatalf("expected env attr, got %q", attrs["env"])
@@ -99,9 +105,11 @@ func TestCorrelationHandlerAddsTraceContext(t *testing.T) {
 	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:          next,
-		resourceAttrs: resourceToSlogAttrs(res),
-		serviceName:   "mesh-stream",
+		next:                  next,
+		resourceAttrs:         resourceToSlogAttrs(res),
+		serviceName:           "mesh-stream",
+		deploymentEnvironment: "dev1",
+		serviceVersion:        "1.2.3",
 	})
 
 	tp := sdktrace.NewTracerProvider()

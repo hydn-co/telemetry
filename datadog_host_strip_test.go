@@ -57,9 +57,11 @@ func TestRecordStripForbiddenHostAttrsNestedGroup(t *testing.T) {
 func TestCorrelationHandlerStripsHostFromRecord(t *testing.T) {
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:          next,
-		resourceAttrs: nil,
-		serviceName:   "svc",
+		next:                  next,
+		resourceAttrs:         nil,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	})
 	r := slog.NewRecord(time.Time{}, slog.LevelInfo, "hi", 0)
 	r.AddAttrs(slog.String("host", "should-not-appear"), slog.String("k", "v"))
@@ -73,6 +75,10 @@ func TestCorrelationHandlerStripsHostFromRecord(t *testing.T) {
 	}
 	if attrs["k"] != "v" {
 		t.Fatalf("expected k=v, got %q", attrs["k"])
+	}
+	if attrs["dd.service"] != "svc" || attrs["dd.env"] != "te" || attrs["dd.version"] != "tv" {
+		t.Fatalf("expected dd.* unified tags, got dd.service=%q dd.env=%q dd.version=%q",
+			attrs["dd.service"], attrs["dd.env"], attrs["dd.version"])
 	}
 }
 
@@ -94,9 +100,11 @@ func TestDatadogHostStripReplaceAttr(t *testing.T) {
 func TestCorrelationHandlerStripsConflictingServiceAttrs(t *testing.T) {
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:          next,
-		resourceAttrs: nil,
-		serviceName:   "svc",
+		next:                  next,
+		resourceAttrs:         nil,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	})
 	r := slog.NewRecord(time.Time{}, slog.LevelInfo, "hi", 0)
 	r.AddAttrs(
@@ -120,12 +128,41 @@ func TestCorrelationHandlerStripsConflictingServiceAttrs(t *testing.T) {
 	}
 }
 
+func TestCorrelationHandlerStripsConflictingDDUnifiedAttrs(t *testing.T) {
+	next := &captureHandler{}
+	logger := slog.New(&correlationHandler{
+		next:                  next,
+		resourceAttrs:         nil,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
+	})
+	r := slog.NewRecord(time.Time{}, slog.LevelInfo, "hi", 0)
+	r.AddAttrs(
+		slog.String("dd.service", "wrong-svc"),
+		slog.String("dd.env", "wrong-env"),
+		slog.String("dd.version", "wrong-ver"),
+		slog.String("k", "v"),
+	)
+	_ = logger.Handler().Handle(context.Background(), r)
+	attrs := recordAttrs(next.records[0])
+	if attrs["dd.service"] != "svc" || attrs["dd.env"] != "te" || attrs["dd.version"] != "tv" {
+		t.Fatalf("expected canonical dd.* tags, got dd.service=%q dd.env=%q dd.version=%q",
+			attrs["dd.service"], attrs["dd.env"], attrs["dd.version"])
+	}
+	if attrs["k"] != "v" {
+		t.Fatalf("expected k=v, got %q", attrs["k"])
+	}
+}
+
 func TestCorrelationHandlerNormalizesUUIDAttrToString(t *testing.T) {
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:          next,
-		resourceAttrs: nil,
-		serviceName:   "svc",
+		next:                  next,
+		resourceAttrs:         nil,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	})
 	id := uuid.MustParse("01234567-89ab-cdef-0123-456789abcdef")
 
@@ -157,9 +194,11 @@ func TestCorrelationHandlerNormalizesUUIDAttrToString(t *testing.T) {
 func TestCorrelationHandlerNormalizesUUIDsInsideMapsAndSlices(t *testing.T) {
 	next := &captureHandler{}
 	logger := slog.New(&correlationHandler{
-		next:          next,
-		resourceAttrs: nil,
-		serviceName:   "svc",
+		next:                  next,
+		resourceAttrs:         nil,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	})
 	id := uuid.MustParse("01234567-89ab-cdef-0123-456789abcdef")
 	payload := map[string]any{
@@ -204,9 +243,11 @@ func TestCorrelationHandlerWithAttrsStripsConflictingServiceAttrs(t *testing.T) 
 	var buf bytes.Buffer
 	jsonH := slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: datadogHostStripReplaceAttr})
 	logger := slog.New(&correlationHandler{
-		next:          jsonH,
-		resourceAttrs: nil,
-		serviceName:   "svc",
+		next:                  jsonH,
+		resourceAttrs:         nil,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	}).With("service", map[string]any{"name": "wrong"}, "service.name", "wrong", "a", "1")
 
 	logger.Info("m")
@@ -222,8 +263,8 @@ func TestCorrelationHandlerWithAttrsStripsConflictingServiceAttrs(t *testing.T) 
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
 		t.Fatal(err)
 	}
-	if obj["service"] != "svc" {
-		t.Fatalf("expected canonical service attr, got %#v", obj["service"])
+	if obj["service"] != "svc" || obj["dd.service"] != "svc" || obj["dd.env"] != "te" || obj["dd.version"] != "tv" {
+		t.Fatalf("expected canonical service and dd.* tags, got %#v", obj)
 	}
 	if obj["a"] != "1" {
 		t.Fatalf("expected a=1, got %#v", obj["a"])
@@ -234,8 +275,10 @@ func TestCorrelationHandlerWithGroupStripsTopLevelServiceGroup(t *testing.T) {
 	var buf bytes.Buffer
 	jsonH := slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: datadogHostStripReplaceAttr})
 	logger := slog.New(&correlationHandler{
-		next:        jsonH,
-		serviceName: "svc",
+		next:                  jsonH,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	}).WithGroup("service").With("name", "wrong")
 
 	logger.Info("m")
@@ -248,8 +291,8 @@ func TestCorrelationHandlerWithGroupStripsTopLevelServiceGroup(t *testing.T) {
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
 		t.Fatal(err)
 	}
-	if obj["service"] != "svc" {
-		t.Fatalf("expected canonical top-level service attr, got %#v", obj["service"])
+	if obj["service"] != "svc" || obj["dd.service"] != "svc" {
+		t.Fatalf("expected canonical top-level service and dd.service, got %#v", obj)
 	}
 	if _, ok := obj["name"]; ok {
 		t.Fatalf("service group attrs must not leak to top level: %s", line)
@@ -260,8 +303,10 @@ func TestCorrelationHandlerWithGroupStripsTopLevelHostGroup(t *testing.T) {
 	var buf bytes.Buffer
 	jsonH := slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: datadogHostStripReplaceAttr})
 	logger := slog.New(&correlationHandler{
-		next:        jsonH,
-		serviceName: "svc",
+		next:                  jsonH,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	}).WithGroup("host").With("name", "bad-host")
 
 	logger.Info("m")
@@ -274,8 +319,8 @@ func TestCorrelationHandlerWithGroupStripsTopLevelHostGroup(t *testing.T) {
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
 		t.Fatal(err)
 	}
-	if obj["service"] != "svc" {
-		t.Fatalf("expected canonical top-level service attr, got %#v", obj["service"])
+	if obj["service"] != "svc" || obj["dd.service"] != "svc" {
+		t.Fatalf("expected canonical top-level service and dd.service, got %#v", obj)
 	}
 }
 
@@ -283,8 +328,10 @@ func TestCorrelationHandlerPreservesNestedPeerServiceAndHost(t *testing.T) {
 	var buf bytes.Buffer
 	jsonH := slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: datadogHostStripReplaceAttr})
 	logger := slog.New(&correlationHandler{
-		next:        jsonH,
-		serviceName: "svc",
+		next:                  jsonH,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	}).WithGroup("peer").With("service", "postgres", "host", "db.internal")
 
 	logger.Info("m")
@@ -294,8 +341,8 @@ func TestCorrelationHandlerPreservesNestedPeerServiceAndHost(t *testing.T) {
 	if err := json.Unmarshal([]byte(line), &obj); err != nil {
 		t.Fatal(err)
 	}
-	if obj["service"] != "svc" {
-		t.Fatalf("expected canonical top-level service attr, got %#v", obj["service"])
+	if obj["service"] != "svc" || obj["dd.service"] != "svc" {
+		t.Fatalf("expected canonical top-level service and dd.service, got %#v", obj)
 	}
 	peer, ok := obj["peer"].(map[string]any)
 	if !ok {
@@ -313,8 +360,10 @@ func TestCorrelationHandlerMergesRepeatedWithAttrsUnderSameGroup(t *testing.T) {
 	var buf bytes.Buffer
 	jsonH := slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: datadogHostStripReplaceAttr})
 	logger := slog.New(&correlationHandler{
-		next:        jsonH,
-		serviceName: "svc",
+		next:                  jsonH,
+		serviceName:           "svc",
+		deploymentEnvironment: "te",
+		serviceVersion:        "tv",
 	}).WithGroup("peer").With("service", "postgres").With("host", "db.internal")
 
 	logger.Info("m", "role", "read")
@@ -330,8 +379,8 @@ func TestCorrelationHandlerMergesRepeatedWithAttrsUnderSameGroup(t *testing.T) {
 	if peer["service"] != "postgres" || peer["host"] != "db.internal" || peer["role"] != "read" {
 		t.Fatalf("expected merged peer attrs, got %#v", peer)
 	}
-	if obj["service"] != "svc" {
-		t.Fatalf("expected canonical top-level service attr, got %#v", obj["service"])
+	if obj["service"] != "svc" || obj["dd.service"] != "svc" {
+		t.Fatalf("expected canonical top-level service and dd.service, got %#v", obj)
 	}
 }
 
@@ -339,9 +388,10 @@ func TestFilterForbiddenHostAttrs(t *testing.T) {
 	filtered := filterReservedDatadogLogAttrs(nil, []slog.Attr{
 		slog.String("host", "x"),
 		slog.String("service", "blob"),
+		slog.String("dd.service", "blob-dd"),
 		slog.String("peer.service", "postgres"),
 		slog.Int("n", 1),
-	})
+	}, false)
 	if len(filtered) != 2 || filtered[0].Key != "peer.service" || filtered[1].Key != "n" {
 		t.Fatalf("got %+v", filtered)
 	}
@@ -351,7 +401,7 @@ func TestStripDatadogHostHandlerEndToEndJSON(t *testing.T) {
 	var buf bytes.Buffer
 	jsonH := slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: datadogHostStripReplaceAttr})
 	h := &stripReservedDatadogAttrsHandler{next: jsonH}
-	h2 := h.WithAttrs([]slog.Attr{slog.String("host", "bad"), slog.String("service", "blob"), slog.String("a", "1")})
+	h2 := h.WithAttrs([]slog.Attr{slog.String("host", "bad"), slog.String("service", "blob"), slog.String("dd.service", "blob"), slog.String("a", "1")})
 	_ = h2.Handle(context.Background(), slog.NewRecord(time.Time{}, slog.LevelInfo, "m", 0))
 	line := buf.String()
 	if strings.Contains(line, `"host"`) {
@@ -360,12 +410,42 @@ func TestStripDatadogHostHandlerEndToEndJSON(t *testing.T) {
 	if strings.Contains(line, `"service"`) {
 		t.Fatalf("JSON must not contain reserved service key: %s", line)
 	}
+	if strings.Contains(line, `"dd.service"`) {
+		t.Fatalf("JSON must not contain reserved dd.service from WithAttrs: %s", line)
+	}
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &obj); err != nil {
 		t.Fatal(err)
 	}
 	if obj["a"] != "1" {
 		t.Fatalf("expected a=1, got %v", obj["a"])
+	}
+}
+
+func TestStripHandlerPreservesFlatServiceForOTLPBridge(t *testing.T) {
+	// After correlationHandler, records carry a flat string "service" for Datadog.
+	// The OTLP path must not strip it; resource service.name alone is not always
+	// mapped to Log Explorer's Service facet (e.g. ACA managed OTLP → Datadog).
+	var buf bytes.Buffer
+	jsonH := slog.NewJSONHandler(&buf, &slog.HandlerOptions{ReplaceAttr: datadogHostStripReplaceAttr})
+	h := &stripReservedDatadogAttrsHandler{next: jsonH}
+	r := slog.NewRecord(time.Time{}, slog.LevelInfo, "m", 0)
+	r.AddAttrs(
+		slog.String("service", "control-api"),
+		slog.String("dd.service", "control-api"),
+		slog.String("dd.env", "prod"),
+		slog.String("dd.version", "1.0.0"),
+		slog.String("msg_key", "v"),
+	)
+	_ = h.Handle(context.Background(), r)
+	line := strings.TrimSpace(buf.String())
+	for _, want := range []string{`"service":"control-api"`, `"dd.service":"control-api"`, `"dd.env":"prod"`, `"dd.version":"1.0.0"`} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("expected %q in OTLP bridge output, got %s", want, line)
+		}
+	}
+	if !strings.Contains(line, `"msg_key":"v"`) {
+		t.Fatalf("expected msg_key preserved, got %s", line)
 	}
 }
 
