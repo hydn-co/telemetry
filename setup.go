@@ -128,13 +128,13 @@ const defaultDatadogLogSource = "go"
 // a span is active. User records are stripped of reserved Datadog keys so callers cannot override
 // service mapping or host mapping (datadog_host_strip.go).
 type correlationHandler struct {
-	next                   slog.Handler
-	resourceAttrs          []slog.Attr
-	serviceName            string
-	deploymentEnvironment  string
-	serviceVersion         string
-	scopedAttrs            []scopedSlogAttrs
-	groups                 []string
+	next                  slog.Handler
+	resourceAttrs         []slog.Attr
+	serviceName           string
+	deploymentEnvironment string
+	serviceVersion        string
+	scopedAttrs           []scopedSlogAttrs
+	groups                []string
 }
 
 func (h *correlationHandler) Enabled(ctx context.Context, level slog.Level) bool {
