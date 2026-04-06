@@ -539,10 +539,9 @@ func podNameFromEnv() string {
 }
 
 func telemetryResource(serviceName, environment, version string) *resource.Resource {
-	// Empty schemaURL avoids some pipelines expanding resource into nested objects that
-	// confuse Datadog's Service facet. Use standard OTel resource keys only: Datadog maps
-	// service.name → service, service.version → version, deployment.environment.name → env
-	// (see https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/).
+	// Use the canonical semconv schema on the shared OTLP resource so downstream trace
+	// pipelines keep service.name/service.version/environment as standard resource attrs.
+	// Datadog-specific log shaping happens later on per-record slog attrs instead.
 	attrs := []attribute.KeyValue{
 		semconv.ServiceName(serviceName),
 		semconv.ServiceVersion(version),
@@ -600,7 +599,7 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 	}
 	attrs = appendResourceAttributesFromEnv(attrs)
 	attrs = stripHostResourceAttributes(attrs)
-	return resource.NewWithAttributes("", attrs...)
+	return resource.NewWithAttributes(semconv.SchemaURL, attrs...)
 }
 
 // skipResourceKeyOnLogRecords reports resource keys we do not copy onto every slog record.

@@ -413,6 +413,23 @@ func TestResourceToSlogAttrsOmitsVerboseResourceNamespaces(t *testing.T) {
 	}
 }
 
+func TestTelemetryResourceUsesSemconvSchemaAfterSDKMerge(t *testing.T) {
+	t.Setenv(EnvOTELServiceName, "mesh-stream")
+
+	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
+	if got := res.SchemaURL(); got != semconv.SchemaURL {
+		t.Fatalf("resource schema URL = %q, want %q", got, semconv.SchemaURL)
+	}
+
+	merged := simulateSDKResourceMerge(t, res)
+	if got := merged.SchemaURL(); got != semconv.SchemaURL {
+		t.Fatalf("merged resource schema URL = %q, want %q", got, semconv.SchemaURL)
+	}
+	if svc := resourceStringAttr(merged, semconv.ServiceNameKey); svc != "mesh-stream" {
+		t.Fatalf("merged service.name = %q, want mesh-stream", svc)
+	}
+}
+
 func TestResourceStartupDiagnosticsAttrIncludesMergedServiceIdentity(t *testing.T) {
 	t.Setenv(EnvOTELResourceAttributes,
 		"service.instance.id=$(CONTAINER_APP_REPLICA_NAME),service.namespace=dev2acaenv4cqolh5yc662y,deployment.environment.name=dev2,service.version=0.1.0-alpha.142")
