@@ -20,7 +20,8 @@
 //     but duplicate tagging on the resource from Bicep is fine.
 //
 // See the repository README for environment variables and usage. Callers should invoke [Setup] only when OTLP is
-// enabled for the process; this package does not read application-specific telemetry flags.
+// enabled for the process, or use [Bootstrap] to share the common fallback logging + OTEL setup flow while still
+// keeping application-specific enable flags at the call site.
 //
 // The shutdown function returned by [Setup] is idempotent; defer it on exit.
 package telemetry
@@ -88,6 +89,47 @@ type Options struct {
 	PrimaryLogWriter io.Writer
 }
 
+// BootstrapOptions configures [Bootstrap]. Callers retain ownership of the
+// telemetry enable flag and pass it in explicitly.
+type BootstrapOptions struct {
+	// Enabled controls whether OTEL setup runs. When false, Bootstrap installs
+	// fallback slog logging instead of OTLP exporters.
+	Enabled bool
+
+	// ServiceName and ServiceVersion backfill OTEL_SERVICE_NAME and
+	// OTEL_SERVICE_VERSION when telemetry is enabled and those env vars are
+	// currently unset.
+	ServiceName    string
+	ServiceVersion string
+
+	// PrimaryLogWriter controls the primary sink for both fallback logging and
+	// OTEL-backed logging. Defaults to os.Stdout when nil.
+	PrimaryLogWriter io.Writer
+}
+
+const envLogFormat = "LOG_FORMAT"
+
+// Bootstrap initializes either fallback slog logging or the OTEL-backed logger
+// depending on opts.Enabled. Callers continue to own any app-specific
+// `*_TELEMETRY_ENABLED` flag parsing and pass the resulting boolean here.
+func Bootstrap(ctx context.Context, opts BootstrapOptions) func() {
+	if opts.Enabled {
+		setOTELServiceIdentity(opts.ServiceName, opts.ServiceVersion)
+		return Setup(ctx, Options{PrimaryLogWriter: opts.PrimaryLogWriter})
+	}
+	setupFallbackLogging(opts.PrimaryLogWriter)
+	return func() {}
+}
+
+func setOTELServiceIdentity(serviceName, serviceVersion string) {
+	if serviceName != "" && os.Getenv(EnvOTELServiceName) == "" {
+		_ = os.Setenv(EnvOTELServiceName, serviceName)
+	}
+	if serviceVersion != "" && os.Getenv(EnvOTELServiceVersion) == "" {
+		_ = os.Setenv(EnvOTELServiceVersion, serviceVersion)
+	}
+}
+
 func primarySlogLevel() slog.Level {
 	v := strings.TrimSpace(os.Getenv(EnvLogLevel))
 	if v == "" {
@@ -98,6 +140,30 @@ func primarySlogLevel() slog.Level {
 		return slog.LevelInfo
 	}
 	return level
+}
+
+func normalizeFallbackLogFormat(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "text", "pretty", "console":
+		return "text"
+	default:
+		return "json"
+	}
+}
+
+func newFallbackLogHandler(w io.Writer, level slog.Level, format string) slog.Handler {
+	opts := &slog.HandlerOptions{Level: level}
+	if normalizeFallbackLogFormat(format) == "text" {
+		return slog.NewTextHandler(w, opts)
+	}
+	return slog.NewJSONHandler(w, opts)
+}
+
+func setupFallbackLogging(w io.Writer) {
+	if w == nil {
+		w = os.Stdout
+	}
+	slog.SetDefault(slog.New(newFallbackLogHandler(w, primarySlogLevel(), os.Getenv(envLogFormat))))
 }
 
 // requireOTELEnv panics if any required OTEL env var is missing (fail fast).

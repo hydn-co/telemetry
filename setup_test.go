@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 
@@ -48,6 +49,90 @@ func (h *captureHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 
 func (h *captureHandler) WithGroup(name string) slog.Handler {
 	return &captureHandler{records: h.records}
+}
+
+func TestBootstrapUsesTextFormatAliasesForFallback(t *testing.T) {
+	for _, format := range []string{"text", "pretty", "console"} {
+		t.Run(format, func(t *testing.T) {
+			t.Setenv(envLogFormat, format)
+
+			var buf bytes.Buffer
+			prev := slog.Default()
+			t.Cleanup(func() {
+				slog.SetDefault(prev)
+			})
+
+			shutdown := Bootstrap(context.Background(), BootstrapOptions{
+				Enabled:          false,
+				PrimaryLogWriter: &buf,
+			})
+			t.Cleanup(shutdown)
+
+			slog.Info("hello world", "component", "shared")
+
+			out := buf.String()
+			if !strings.Contains(out, "msg=\"hello world\"") {
+				t.Fatalf("expected text slog output, got %q", out)
+			}
+			if !strings.Contains(out, "component=shared") {
+				t.Fatalf("expected text attribute output, got %q", out)
+			}
+		})
+	}
+}
+
+func TestBootstrapFallbackDefaultsToJSON(t *testing.T) {
+	t.Setenv(envLogFormat, "")
+
+	var buf bytes.Buffer
+	prev := slog.Default()
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+	})
+
+	shutdown := Bootstrap(context.Background(), BootstrapOptions{
+		Enabled:          false,
+		PrimaryLogWriter: &buf,
+	})
+	t.Cleanup(shutdown)
+
+	slog.Info("hello world", "component", "shared")
+
+	out := buf.String()
+	if !strings.Contains(out, "\"msg\":\"hello world\"") {
+		t.Fatalf("expected JSON slog output, got %q", out)
+	}
+	if !strings.Contains(out, "\"component\":\"shared\"") {
+		t.Fatalf("expected JSON attribute output, got %q", out)
+	}
+}
+
+func TestSetOTELServiceIdentityBackfillsUnsetValues(t *testing.T) {
+	t.Setenv(EnvOTELServiceName, "")
+	t.Setenv(EnvOTELServiceVersion, "")
+
+	setOTELServiceIdentity("mesh-stream", "1.2.3")
+
+	if got := os.Getenv(EnvOTELServiceName); got != "mesh-stream" {
+		t.Fatalf("service name = %q, want mesh-stream", got)
+	}
+	if got := os.Getenv(EnvOTELServiceVersion); got != "1.2.3" {
+		t.Fatalf("service version = %q, want 1.2.3", got)
+	}
+}
+
+func TestSetOTELServiceIdentityPreservesExistingValues(t *testing.T) {
+	t.Setenv(EnvOTELServiceName, "existing-service")
+	t.Setenv(EnvOTELServiceVersion, "9.9.9")
+
+	setOTELServiceIdentity("mesh-stream", "1.2.3")
+
+	if got := os.Getenv(EnvOTELServiceName); got != "existing-service" {
+		t.Fatalf("service name = %q, want existing-service", got)
+	}
+	if got := os.Getenv(EnvOTELServiceVersion); got != "9.9.9" {
+		t.Fatalf("service version = %q, want 9.9.9", got)
+	}
 }
 
 func TestCorrelationHandlerAddsUnifiedTags(t *testing.T) {
