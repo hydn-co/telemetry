@@ -14,7 +14,9 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // simulateSDKResourceMerge reproduces what sdklog.WithResource (and sdktrace/sdkmetric)
@@ -231,6 +233,109 @@ func TestMinLevelHandlerFiltersLowerLevels(t *testing.T) {
 	}
 	if next.records[0].Message != "keep me" {
 		t.Fatalf("expected info record to be kept, got %q", next.records[0].Message)
+	}
+}
+
+func TestTraceSamplerConfigFromEnvDefaultsToParentBasedAlwaysOn(t *testing.T) {
+	t.Setenv(EnvOTELTracesSampler, "")
+	t.Setenv(EnvOTELTracesSamplerArg, "")
+
+	cfg := traceSamplerConfigFromEnv()
+	if cfg.name != "parentbased_always_on" {
+		t.Fatalf("trace sampler = %q, want parentbased_always_on", cfg.name)
+	}
+	if cfg.arg != "" {
+		t.Fatalf("trace sampler arg = %q, want empty", cfg.arg)
+	}
+	if got := sampleDecision(cfg.sampler); got != sdktrace.RecordAndSample {
+		t.Fatalf("sampler decision = %v, want RecordAndSample", got)
+	}
+}
+
+func TestTraceSamplerConfigFromEnvUsesParentBasedTraceIDRatio(t *testing.T) {
+	t.Setenv(EnvOTELTracesSampler, "parentbased_traceidratio")
+	t.Setenv(EnvOTELTracesSamplerArg, "0")
+
+	cfg := traceSamplerConfigFromEnv()
+	if cfg.name != "parentbased_traceidratio" {
+		t.Fatalf("trace sampler = %q, want parentbased_traceidratio", cfg.name)
+	}
+	if cfg.arg != "0" {
+		t.Fatalf("trace sampler arg = %q, want 0", cfg.arg)
+	}
+	if got := sampleDecision(cfg.sampler); got != sdktrace.Drop {
+		t.Fatalf("sampler decision = %v, want Drop", got)
+	}
+}
+
+func TestTraceSamplerConfigFromEnvFallsBackOnInvalidRatio(t *testing.T) {
+	t.Setenv(EnvOTELTracesSampler, "traceidratio")
+	t.Setenv(EnvOTELTracesSamplerArg, "banana")
+
+	cfg := traceSamplerConfigFromEnv()
+	if cfg.name != "traceidratio" {
+		t.Fatalf("trace sampler = %q, want traceidratio", cfg.name)
+	}
+	if cfg.arg != "1" {
+		t.Fatalf("trace sampler arg = %q, want 1", cfg.arg)
+	}
+	if got := sampleDecision(cfg.sampler); got != sdktrace.RecordAndSample {
+		t.Fatalf("sampler decision = %v, want RecordAndSample", got)
+	}
+}
+
+func TestShouldMarkDatadogTraceAnalytics(t *testing.T) {
+	tests := []struct {
+		name string
+		kind trace.SpanKind
+		want bool
+	}{
+		{name: "server", kind: trace.SpanKindServer, want: true},
+		{name: "consumer", kind: trace.SpanKindConsumer, want: true},
+		{name: "client", kind: trace.SpanKindClient, want: false},
+		{name: "producer", kind: trace.SpanKindProducer, want: false},
+		{name: "internal", kind: trace.SpanKindInternal, want: false},
+		{name: "unspecified", kind: trace.SpanKindUnspecified, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldMarkDatadogTraceAnalytics(tt.kind); got != tt.want {
+				t.Fatalf("shouldMarkDatadogTraceAnalytics(%v) = %v, want %v", tt.kind, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDatadogTraceAnalyticsSpanProcessorSetsCompatibilityAttr(t *testing.T) {
+	tests := []struct {
+		name string
+		kind trace.SpanKind
+		want bool
+	}{
+		{name: "server", kind: trace.SpanKindServer, want: true},
+		{name: "consumer", kind: trace.SpanKindConsumer, want: true},
+		{name: "client", kind: trace.SpanKindClient, want: false},
+		{name: "internal", kind: trace.SpanKindInternal, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span := endedSpanWithKind(t, tt.kind)
+			got, ok := spanStringAttr(span.Attributes(), datadogTraceAnalyticsEventKey)
+			if tt.want {
+				if !ok {
+					t.Fatalf("expected %q attr on %v span", datadogTraceAnalyticsEventKey, tt.kind)
+				}
+				if got != datadogTraceAnalyticsEventValue {
+					t.Fatalf("%q attr = %q, want %q", datadogTraceAnalyticsEventKey, got, datadogTraceAnalyticsEventValue)
+				}
+				return
+			}
+			if ok {
+				t.Fatalf("did not expect %q attr on %v span, got %q", datadogTraceAnalyticsEventKey, tt.kind, got)
+			}
+		})
 	}
 }
 
@@ -558,7 +663,7 @@ func TestLogTelemetryInitializedIncludesTraceStatusAndResourceIdentity(t *testin
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	res := telemetryResource("mesh-stream", "dev1", "1.2.3")
-	logTelemetryInitialized("stderr", "/tmp/app.log", true, true, true, res)
+	logTelemetryInitialized("stderr", "/tmp/app.log", true, true, true, res, traceSamplerConfig{name: "parentbased_always_on"})
 
 	var obj map[string]any
 	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &obj); err != nil {
@@ -566,6 +671,15 @@ func TestLogTelemetryInitializedIncludesTraceStatusAndResourceIdentity(t *testin
 	}
 	if obj["otlp_traces_enabled"] != true {
 		t.Fatalf("expected otlp_traces_enabled=true, got %#v", obj["otlp_traces_enabled"])
+	}
+	if obj["trace_sampler"] != "parentbased_always_on" {
+		t.Fatalf("expected trace_sampler parentbased_always_on, got %#v", obj["trace_sampler"])
+	}
+	if obj["datadog_trace_analytics_enabled"] != true {
+		t.Fatalf("expected datadog_trace_analytics_enabled=true, got %#v", obj["datadog_trace_analytics_enabled"])
+	}
+	if obj["datadog_trace_analytics_span_kinds"] != datadogTraceAnalyticsSpanKinds {
+		t.Fatalf("expected datadog_trace_analytics_span_kinds %q, got %#v", datadogTraceAnalyticsSpanKinds, obj["datadog_trace_analytics_span_kinds"])
 	}
 	resourceObj, ok := obj["resource"].(map[string]any)
 	if !ok {
@@ -711,4 +825,48 @@ func groupAttrs(a slog.Attr) map[string]string {
 		attrs[inner.Key] = inner.Value.String()
 	}
 	return attrs
+}
+
+func endedSpanWithKind(t *testing.T, kind trace.SpanKind) sdktrace.ReadOnlySpan {
+	t.Helper()
+
+	recorder := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(newDatadogTraceAnalyticsSpanProcessor()),
+		sdktrace.WithSpanProcessor(recorder),
+	)
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+	})
+
+	tracer := tp.Tracer("telemetry-test")
+	_, span := tracer.Start(context.Background(), "request", trace.WithSpanKind(kind))
+	span.End()
+
+	ended := recorder.Ended()
+	if len(ended) != 1 {
+		t.Fatalf("ended span count = %d, want 1", len(ended))
+	}
+	return ended[0]
+}
+
+func spanStringAttr(attrs []attribute.KeyValue, key string) (string, bool) {
+	for _, attr := range attrs {
+		if string(attr.Key) != key {
+			continue
+		}
+		if attr.Value.Type() == attribute.STRING {
+			return attr.Value.AsString(), true
+		}
+		return attr.Value.Emit(), true
+	}
+	return "", false
+}
+
+func sampleDecision(sampler sdktrace.Sampler) sdktrace.SamplingDecision {
+	return sampler.ShouldSample(sdktrace.SamplingParameters{
+		ParentContext: context.Background(),
+		TraceID:       trace.TraceID{15: 1},
+		Name:          "request",
+	}).Decision
 }

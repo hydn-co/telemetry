@@ -5,6 +5,8 @@
 // Datadog-oriented behavior (see https://docs.datadoghq.com/opentelemetry/mapping/semantic_mapping/):
 //   - OTLP resource carries the full OpenTelemetry resource (service.*, process.*, telemetry.*, OS,
 //     deployment, optional K8s/ACA, etc.); host.* is never emitted.
+//   - The trace provider stamps Datadog's OTLP compatibility attribute analytics.event=true on
+//     server and consumer spans so Trace Analytics continues to work without dd-trace-go.
 //   - Each log line adds flat top-level "service" plus dd.service, dd.env, dd.version for
 //     Datadog log pipeline remappers / facets; strips conflicting user service/service.*,
 //     dd.service/dd.env/dd.version, and host/host.* attrs; copies high-signal tags
@@ -67,6 +69,14 @@ const (
 	EnvOTELServiceName           = "OTEL_SERVICE_NAME"
 	EnvOTELDeploymentEnvironment = "OTEL_DEPLOYMENT_ENVIRONMENT"
 	EnvOTELServiceVersion        = "OTEL_SERVICE_VERSION"
+	EnvOTELTracesSampler         = "OTEL_TRACES_SAMPLER"
+	EnvOTELTracesSamplerArg      = "OTEL_TRACES_SAMPLER_ARG"
+)
+
+const (
+	datadogTraceAnalyticsEventKey   = "analytics.event"
+	datadogTraceAnalyticsEventValue = "true"
+	datadogTraceAnalyticsSpanKinds  = "server,consumer"
 )
 
 // EnvLogLevel is the optional slog level for the primary JSON sink and OTLP log export
@@ -140,6 +150,95 @@ func primarySlogLevel() slog.Level {
 		return slog.LevelInfo
 	}
 	return level
+}
+
+type traceSamplerConfig struct {
+	name    string
+	arg     string
+	sampler sdktrace.Sampler
+}
+
+func defaultTraceSamplerConfig() traceSamplerConfig {
+	return traceSamplerConfig{
+		name:    "parentbased_always_on",
+		sampler: sdktrace.ParentBased(sdktrace.AlwaysSample()),
+	}
+}
+
+func traceSamplerConfigFromEnv() traceSamplerConfig {
+	name := strings.ToLower(strings.TrimSpace(os.Getenv(EnvOTELTracesSampler)))
+	if name == "" {
+		return defaultTraceSamplerConfig()
+	}
+
+	arg := strings.TrimSpace(os.Getenv(EnvOTELTracesSamplerArg))
+	switch name {
+	case "always_on":
+		return traceSamplerConfig{name: name, sampler: sdktrace.AlwaysSample()}
+	case "always_off":
+		return traceSamplerConfig{name: name, sampler: sdktrace.NeverSample()}
+	case "traceidratio":
+		rate := parseTraceSamplerRatioArg(arg)
+		return traceSamplerConfig{name: name, arg: formatTraceSamplerRatioArg(rate), sampler: sdktrace.TraceIDRatioBased(rate)}
+	case "parentbased_always_on":
+		return traceSamplerConfig{name: name, sampler: sdktrace.ParentBased(sdktrace.AlwaysSample())}
+	case "parentbased_always_off":
+		return traceSamplerConfig{name: name, sampler: sdktrace.ParentBased(sdktrace.NeverSample())}
+	case "parentbased_traceidratio":
+		rate := parseTraceSamplerRatioArg(arg)
+		return traceSamplerConfig{name: name, arg: formatTraceSamplerRatioArg(rate), sampler: sdktrace.ParentBased(sdktrace.TraceIDRatioBased(rate))}
+	default:
+		return defaultTraceSamplerConfig()
+	}
+}
+
+func parseTraceSamplerRatioArg(arg string) float64 {
+	if strings.TrimSpace(arg) == "" {
+		return 1
+	}
+	rate, err := strconv.ParseFloat(strings.TrimSpace(arg), 64)
+	if err != nil || rate < 0 || rate > 1 {
+		return 1
+	}
+	return rate
+}
+
+func formatTraceSamplerRatioArg(rate float64) string {
+	return strconv.FormatFloat(rate, 'f', -1, 64)
+}
+
+// datadogTraceAnalyticsSpanProcessor stamps Datadog's OTLP compatibility attribute on
+// service-entry spans so Trace Analytics continues to work when this package exports OTLP.
+type datadogTraceAnalyticsSpanProcessor struct{}
+
+func newDatadogTraceAnalyticsSpanProcessor() sdktrace.SpanProcessor {
+	return datadogTraceAnalyticsSpanProcessor{}
+}
+
+func (datadogTraceAnalyticsSpanProcessor) OnStart(_ context.Context, span sdktrace.ReadWriteSpan) {
+	if !span.IsRecording() || !shouldMarkDatadogTraceAnalytics(span.SpanKind()) {
+		return
+	}
+	span.SetAttributes(attribute.String(datadogTraceAnalyticsEventKey, datadogTraceAnalyticsEventValue))
+}
+
+func (datadogTraceAnalyticsSpanProcessor) OnEnd(sdktrace.ReadOnlySpan) {}
+
+func (datadogTraceAnalyticsSpanProcessor) Shutdown(context.Context) error {
+	return nil
+}
+
+func (datadogTraceAnalyticsSpanProcessor) ForceFlush(context.Context) error {
+	return nil
+}
+
+func shouldMarkDatadogTraceAnalytics(kind trace.SpanKind) bool {
+	switch kind {
+	case trace.SpanKindServer, trace.SpanKindConsumer:
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeFallbackLogFormat(format string) string {
@@ -324,10 +423,12 @@ func (h *minLevelHandler) WithGroup(name string) slog.Handler {
 // OTEL_DEPLOYMENT_ENVIRONMENT, and OTEL_SERVICE_VERSION must be set; Setup panics
 // otherwise. Logging is installed before exporter setup so bootstrap failures are
 // always emitted through the package logger. The returned function is idempotent
-// and should be called on process exit.
+// and should be called on process exit. Traces also carry Datadog Trace Analytics
+// compatibility on server and consumer spans.
 func Setup(ctx context.Context, opts Options) func() {
 	requireOTELEnv()
 	sanitizeAuthoritativeTelemetryEnvironment()
+	traceSampler := traceSamplerConfigFromEnv()
 
 	serviceName := os.Getenv(EnvOTELServiceName)
 	environment := os.Getenv(EnvOTELDeploymentEnvironment)
@@ -394,16 +495,18 @@ func Setup(ctx context.Context, opts Options) func() {
 	exp, err := otlptracegrpc.New(ctx, otlptracegrpc.WithInsecure())
 	if err != nil {
 		slog.Error("failed to create OTLP trace exporter", slog.String("error", err.Error()))
-		logTelemetryInitialized(primaryDesc, logPath, logProvider != nil, metricProvider != nil, false, res)
+		logTelemetryInitialized(primaryDesc, logPath, logProvider != nil, metricProvider != nil, false, res, traceSampler)
 		return makeShutdownFunc(nil, logProvider, metricProvider, logFile, serviceName, version, environment)
 	}
 
 	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSpanProcessor(newDatadogTraceAnalyticsSpanProcessor()),
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(res),
+		sdktrace.WithSampler(traceSampler.sampler),
 	)
 	otel.SetTracerProvider(tp)
-	logTelemetryInitialized(primaryDesc, logPath, logProvider != nil, metricProvider != nil, true, res)
+	logTelemetryInitialized(primaryDesc, logPath, logProvider != nil, metricProvider != nil, true, res, traceSampler)
 
 	return makeShutdownFunc(tp, logProvider, metricProvider, logFile, serviceName, version, environment)
 }
@@ -423,13 +526,19 @@ func newLogger(handlers []slog.Handler, res *resource.Resource, serviceName, dep
 	return slog.New(handler)
 }
 
-func logTelemetryInitialized(primaryDesc, logPath string, logsEnabled, metricsEnabled, tracesEnabled bool, res *resource.Resource) {
+func logTelemetryInitialized(primaryDesc, logPath string, logsEnabled, metricsEnabled, tracesEnabled bool, res *resource.Resource, traceSampler traceSamplerConfig) {
 	args := []any{
 		"primary_log", primaryDesc,
 		"log_file", logPath,
 		"otlp_logs_enabled", logsEnabled,
 		"otlp_metrics_enabled", metricsEnabled,
 		"otlp_traces_enabled", tracesEnabled,
+		"trace_sampler", traceSampler.name,
+		"datadog_trace_analytics_enabled", true,
+		"datadog_trace_analytics_span_kinds", datadogTraceAnalyticsSpanKinds,
+	}
+	if traceSampler.arg != "" {
+		args = append(args, "trace_sampler_arg", traceSampler.arg)
 	}
 	if resourceAttr := resourceStartupDiagnosticsAttr(res); resourceAttr.Key != "" {
 		args = append(args, resourceAttr)
