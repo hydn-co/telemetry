@@ -339,6 +339,39 @@ func TestDatadogTraceAnalyticsSpanProcessorSetsCompatibilityAttr(t *testing.T) {
 	}
 }
 
+func TestDatadogTraceAnalyticsSpanProcessorMarksAPMMeasuredOnServiceEntry(t *testing.T) {
+	tests := []struct {
+		name string
+		kind trace.SpanKind
+		want bool
+	}{
+		{name: "server", kind: trace.SpanKindServer, want: true},
+		{name: "consumer", kind: trace.SpanKindConsumer, want: true},
+		{name: "client", kind: trace.SpanKindClient, want: false},
+		{name: "producer", kind: trace.SpanKindProducer, want: false},
+		{name: "internal", kind: trace.SpanKindInternal, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			span := endedSpanWithKind(t, tt.kind)
+			got, ok := spanInt64Attr(span.Attributes(), datadogAPMMeasuredKey)
+			if tt.want {
+				if !ok {
+					t.Fatalf("expected %q attr on %v span", datadogAPMMeasuredKey, tt.kind)
+				}
+				if got != 1 {
+					t.Fatalf("%q attr = %d, want 1", datadogAPMMeasuredKey, got)
+				}
+				return
+			}
+			if ok {
+				t.Fatalf("did not expect %q attr on %v span, got %d", datadogAPMMeasuredKey, tt.kind, got)
+			}
+		})
+	}
+}
+
 func TestNewOTLPMetricProviderInstallsGlobalMeterProvider(t *testing.T) {
 	prev := otel.GetMeterProvider()
 	t.Cleanup(func() {
@@ -457,6 +490,105 @@ func TestTelemetryResourceSkipsPlaceholderInOTELResourceAttributes(t *testing.T)
 		if string(a.Key) == "deployment.environment.name" && a.Value.AsString() == "$(CONTAINER_APP_REPLICA_NAME)" {
 			t.Fatal("must not merge unexpanded placeholder into OTLP resource")
 		}
+	}
+}
+
+func TestTelemetryResourceIncludesGitAttributesFromOTELEnv(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "")
+	t.Setenv(envOTELGitRepositoryURL, "https://github.com/hydn-co/example")
+	t.Setenv(envDDGitRepositoryURL, "")
+	t.Setenv(envOTELGitCommitSHA, "deadbeefcafef00d0123456789abcdef01234567")
+	t.Setenv(envDDGitCommitSHA, "")
+
+	res := telemetryResource("svc", "dev", "1.0.0")
+
+	if got, ok := resourceStringAttrByKey(res, attrKeyGitRepositoryURL); !ok || got != "https://github.com/hydn-co/example" {
+		t.Fatalf("git.repository_url = %q ok=%v, want https://github.com/hydn-co/example", got, ok)
+	}
+	if got, ok := resourceStringAttrByKey(res, attrKeyGitCommitSHA); !ok || got != "deadbeefcafef00d0123456789abcdef01234567" {
+		t.Fatalf("git.commit.sha = %q ok=%v, want deadbeefcafef00d0123456789abcdef01234567", got, ok)
+	}
+}
+
+func TestTelemetryResourceIncludesGitAttributesFromDDEnvFallback(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "")
+	t.Setenv(envOTELGitRepositoryURL, "")
+	t.Setenv(envDDGitRepositoryURL, "https://github.com/hydn-co/fallback")
+	t.Setenv(envOTELGitCommitSHA, "")
+	t.Setenv(envDDGitCommitSHA, "abcdefabcdefabcdefabcdefabcdefabcdefabcd")
+
+	res := telemetryResource("svc", "dev", "1.0.0")
+
+	if got, ok := resourceStringAttrByKey(res, attrKeyGitRepositoryURL); !ok || got != "https://github.com/hydn-co/fallback" {
+		t.Fatalf("git.repository_url = %q ok=%v, want https://github.com/hydn-co/fallback", got, ok)
+	}
+	if got, ok := resourceStringAttrByKey(res, attrKeyGitCommitSHA); !ok || got != "abcdefabcdefabcdefabcdefabcdefabcdefabcd" {
+		t.Fatalf("git.commit.sha = %q ok=%v, want abcdefabcdefabcdefabcdefabcdefabcdefabcd", got, ok)
+	}
+}
+
+func TestTelemetryResourceOTELGitVarsWinOverDDFallback(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "")
+	t.Setenv(envOTELGitRepositoryURL, "https://github.com/hydn-co/otel-wins")
+	t.Setenv(envDDGitRepositoryURL, "https://github.com/hydn-co/dd-loses")
+	t.Setenv(envOTELGitCommitSHA, "1111111111111111111111111111111111111111")
+	t.Setenv(envDDGitCommitSHA, "2222222222222222222222222222222222222222")
+
+	res := telemetryResource("svc", "dev", "1.0.0")
+
+	if got, _ := resourceStringAttrByKey(res, attrKeyGitRepositoryURL); got != "https://github.com/hydn-co/otel-wins" {
+		t.Fatalf("git.repository_url = %q, want OTEL_* value to win", got)
+	}
+	if got, _ := resourceStringAttrByKey(res, attrKeyGitCommitSHA); got != "1111111111111111111111111111111111111111" {
+		t.Fatalf("git.commit.sha = %q, want OTEL_* value to win", got)
+	}
+}
+
+func TestTelemetryResourceSkipsGitAttributesWhenUnexpandedPlaceholder(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "")
+	t.Setenv(envOTELGitRepositoryURL, "$(GIT_REPO_URL)")
+	t.Setenv(envDDGitRepositoryURL, "${GIT_REPO_URL}")
+	t.Setenv(envOTELGitCommitSHA, "%GIT_SHA%")
+	t.Setenv(envDDGitCommitSHA, "")
+
+	res := telemetryResource("svc", "dev", "1.0.0")
+
+	if _, ok := resourceStringAttrByKey(res, attrKeyGitRepositoryURL); ok {
+		t.Fatal("expected git.repository_url to be omitted when all sources are unexpanded placeholders")
+	}
+	if _, ok := resourceStringAttrByKey(res, attrKeyGitCommitSHA); ok {
+		t.Fatal("expected git.commit.sha to be omitted when all sources are unexpanded placeholders")
+	}
+}
+
+func TestTelemetryResourceOmitsGitAttributesWhenEnvUnset(t *testing.T) {
+	t.Setenv(EnvOTELResourceAttributes, "")
+	t.Setenv(envOTELGitRepositoryURL, "")
+	t.Setenv(envDDGitRepositoryURL, "")
+	t.Setenv(envOTELGitCommitSHA, "")
+	t.Setenv(envDDGitCommitSHA, "")
+
+	res := telemetryResource("svc", "dev", "1.0.0")
+
+	if _, ok := resourceStringAttrByKey(res, attrKeyGitRepositoryURL); ok {
+		t.Fatal("expected git.repository_url to be absent when env unset")
+	}
+	if _, ok := resourceStringAttrByKey(res, attrKeyGitCommitSHA); ok {
+		t.Fatal("expected git.commit.sha to be absent when env unset")
+	}
+}
+
+func TestFirstValidEnvReturnsFirstNonPlaceholder(t *testing.T) {
+	t.Setenv("TEST_FIRST_VALID_A", "")
+	t.Setenv("TEST_FIRST_VALID_B", "$(PLACEHOLDER)")
+	t.Setenv("TEST_FIRST_VALID_C", "real-value")
+	t.Setenv("TEST_FIRST_VALID_D", "other-value")
+
+	if got := firstValidEnv("TEST_FIRST_VALID_A", "TEST_FIRST_VALID_B", "TEST_FIRST_VALID_C", "TEST_FIRST_VALID_D"); got != "real-value" {
+		t.Fatalf("firstValidEnv = %q, want real-value", got)
+	}
+	if got := firstValidEnv("TEST_FIRST_VALID_A", "TEST_FIRST_VALID_B"); got != "" {
+		t.Fatalf("firstValidEnv = %q, want empty", got)
 	}
 }
 
@@ -859,6 +991,32 @@ func spanStringAttr(attrs []attribute.KeyValue, key string) (string, bool) {
 			return attr.Value.AsString(), true
 		}
 		return attr.Value.Emit(), true
+	}
+	return "", false
+}
+
+func spanInt64Attr(attrs []attribute.KeyValue, key string) (int64, bool) {
+	for _, attr := range attrs {
+		if string(attr.Key) != key {
+			continue
+		}
+		if attr.Value.Type() == attribute.INT64 {
+			return attr.Value.AsInt64(), true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+func resourceStringAttrByKey(res *resource.Resource, key string) (string, bool) {
+	for _, kv := range res.Attributes() {
+		if string(kv.Key) != key {
+			continue
+		}
+		if kv.Value.Type() == attribute.STRING {
+			return kv.Value.AsString(), true
+		}
+		return kv.Value.Emit(), true
 	}
 	return "", false
 }

@@ -42,6 +42,8 @@ Export failures for logs/metrics/traces are logged; the process keeps running wh
 | `OTEL_RESOURCE_ATTRIBUTES` | Comma-separated `key=value` pairs merged into the OTLP resource. Keys **`host`**, **`host.*`**, **`hostname`**, **`datadog.host.name`**, bare **`service`**, and **`service.name`** are sanitized out so this package stays authoritative for Datadog host and service identity. |
 | `OTEL_TRACES_SAMPLER` | Optional OpenTelemetry trace sampler. Supported values: `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off`, `parentbased_traceidratio`. Default: `parentbased_always_on`. |
 | `OTEL_TRACES_SAMPLER_ARG` | Argument for ratio-based samplers (`traceidratio`, `parentbased_traceidratio`). Must be a float from `0` to `1`. Invalid values fall back to `1`. |
+| `OTEL_GIT_REPOSITORY_URL` / `DD_GIT_REPOSITORY_URL` | Repo URL for Datadog Source Code Integration + Deployment Tracking. First non-empty, non-placeholder value wins; emitted on the OTLP resource as `git.repository_url`. |
+| `OTEL_GIT_COMMIT_SHA` / `DD_GIT_COMMIT_SHA` | Full commit SHA for SCI + Deployment Tracking. First non-empty, non-placeholder value wins; emitted as `git.commit.sha`. |
 
 ### Optional resource hints (read if set)
 
@@ -97,6 +99,36 @@ Use **`slog.InfoContext` / `slog.ErrorContext`** (and an instrumented HTTP stack
 ## Verification
 
 After startup, at **debug** level, look for `telemetry initialized` and verify `otlp_logs_enabled`, `otlp_metrics_enabled`, `otlp_traces_enabled`, `trace_sampler`, `datadog_trace_analytics_enabled`, and `datadog_trace_analytics_span_kinds`. That startup event also includes a `resource` group with the effective `service_name`, `service_namespace` when present, `service_version`, `service_instance_id`, and `deployment_environment_name`, which is the fastest way to confirm what this process is putting on the OTLP resource before any collector or backend remaps it. Ensure your ACA environment sends **logs**, **traces**, and **metrics** to Datadog when you expect all three.
+
+---
+
+## Datadog billing stance
+
+This package is **deliberately conservative** about the OTLP attributes that can materialize **billed** Datadog entities. Infrastructure Hosts, Container Monitoring, and APM Hosts are separate Datadog SKUs; each can be triggered by specific OTLP resource attributes.
+
+- **No `host.*` / `hostname` / `datadog.host.name`.** Stripped from `OTEL_RESOURCE_ATTRIBUTES` and never set by this package. Prevents an Infrastructure Host entry per process/replica.
+- **No `container.id`.** Not auto-detected from cgroups. Prevents an APM Host or Container Monitoring entity per replica.
+- **No `container.image.name` / `container.image.tag`.** Not emitted. Prevents entries flowing into the Containers product.
+
+Consequence: The **Infrastructure** panel on a service's APM page will be blank. All other APM features (Catalog, Summary, Traces, Version/Deployment Tracking, log correlation) work because they key off `service.name`, `service.version`, `deployment.environment.name`, `env`, `version`, `git.repository_url`, and `git.commit.sha`, none of which add host/container billing.
+
+If you later decide to accept the billing trade-off for infra correlation, add `container.id` / `host.name` via a dedicated code path — do not re-enable them through `OTEL_RESOURCE_ATTRIBUTES`, since the sanitizer will strip them.
+
+---
+
+## Datadog Service Catalog / Service Summary / Version Tracking is empty?
+
+Assuming traces actually arrive in Datadog (filter Trace Explorer by `service:<your-service>`), work through this checklist:
+
+1. **APM stats are not being computed for your OTLP spans.** This is the most common cause of empty **Service Summary** panels (requests / latency / errors). Datadog only shows these when APM stats are computed from top-level spans. Server and consumer spans are auto-top-level; this package also stamps `_dd.measured=1` on them so the Datadog ingest marks them as measured explicitly. If panels are still empty, the ingest side is dropping or not converting spans:
+   - **OTel Collector with Datadog exporter:** set `exporters.datadog.traces.compute_stats_by_span_kind: true` and confirm a `datadog` connector or trace pipeline is present.
+   - **Datadog Agent OTLP receiver:** set `DD_APM_FEATURES=enable_otlp_compute_top_level_by_span_kind` on the agent.
+   - **Azure Container Apps managed OpenTelemetry:** confirm the Datadog destination is wired for **traces** (APM), not only logs and metrics. ACA's managed destination forwards to the Datadog Exporter; without APM wired, spans are discarded at ingest.
+2. **Version Tracking / Deployments tab is empty.** Requires git metadata on the OTLP resource:
+   - Set `OTEL_GIT_REPOSITORY_URL` and `OTEL_GIT_COMMIT_SHA` (or `DD_GIT_*` fallbacks) at build / deploy time. In CI: `OTEL_GIT_COMMIT_SHA=$(git rev-parse HEAD)` and the clone URL.
+   - `service.version` alone populates the version tag but does not draw the Deployments timeline.
+3. **Service Catalog entry is missing or thin.** Auto-discovered catalog entries appear from APM traces with `service.name`. For richer metadata (team, on-call, links, tier), commit a `service.datadog.yaml` **per service repo** (not in this shared library).
+4. **Replicas look merged into one entity.** `service.instance.id` is set from `CONTAINER_APP_REPLICA_NAME` -> `POD_NAME` -> `os.Hostname()`. If your ACA `CONTAINER_APP_REPLICA_NAME` is the literal `$(CONTAINER_APP_REPLICA_NAME)` placeholder, it is intentionally skipped — fix the env injection so the value expands.
 
 ---
 

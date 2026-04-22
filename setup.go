@@ -79,6 +79,15 @@ const (
 	datadogTraceAnalyticsSpanKinds  = "server,consumer"
 )
 
+// datadogAPMMeasuredKey marks a span as eligible for APM stats computation by
+// Datadog's OTLP ingest (Agent or Datadog Exporter). Server and consumer spans
+// are already auto-top-level on the Datadog side, but stamping this explicitly
+// keeps Service Summary stats populated even when the Datadog-side feature flag
+// enable_otlp_compute_top_level_by_span_kind is not enabled or the ingest
+// pipeline otherwise skips implicit top-level detection. Setting the value to
+// 0 would be an explicit opt-out; 1 is the measured marker.
+const datadogAPMMeasuredKey = "_dd.measured"
+
 // EnvLogLevel is the optional slog level for the primary JSON sink and OTLP log export
 // (same threshold). Values match slog.Level.UnmarshalText (e.g. info, debug, warn).
 // Defaults to info when unset or invalid.
@@ -219,7 +228,10 @@ func (datadogTraceAnalyticsSpanProcessor) OnStart(_ context.Context, span sdktra
 	if !span.IsRecording() || !shouldMarkDatadogTraceAnalytics(span.SpanKind()) {
 		return
 	}
-	span.SetAttributes(attribute.String(datadogTraceAnalyticsEventKey, datadogTraceAnalyticsEventValue))
+	span.SetAttributes(
+		attribute.String(datadogTraceAnalyticsEventKey, datadogTraceAnalyticsEventValue),
+		attribute.Int64(datadogAPMMeasuredKey, 1),
+	)
 }
 
 func (datadogTraceAnalyticsSpanProcessor) OnEnd(sdktrace.ReadOnlySpan) {}
@@ -659,6 +671,26 @@ const (
 	envGCPRegion           = "GOOGLE_CLOUD_REGION"
 )
 
+// Git Source Code Integration env vars. Either the OTEL_GIT_* or DD_GIT_*
+// variant may be set at build or deploy time; the first non-empty, non-
+// placeholder value wins. When present, this package emits git.repository_url
+// and git.commit.sha on the OTLP resource so Datadog's Source Code Integration,
+// Deployment Tracking, and Version Tracking drill-downs populate.
+const (
+	envOTELGitRepositoryURL = "OTEL_GIT_REPOSITORY_URL"
+	envDDGitRepositoryURL   = "DD_GIT_REPOSITORY_URL"
+	envOTELGitCommitSHA     = "OTEL_GIT_COMMIT_SHA"
+	envDDGitCommitSHA       = "DD_GIT_COMMIT_SHA"
+)
+
+// Literal OTel resource attribute keys for Datadog Source Code Integration.
+// Semconv v1.24.0 does not expose typed helpers for these yet; Datadog reads
+// them from the literal keys regardless.
+const (
+	attrKeyGitRepositoryURL = "git.repository_url"
+	attrKeyGitCommitSHA     = "git.commit.sha"
+)
+
 // shellOrComposePlaceholder matches "$(VAR)" / "$( VAR )" anywhere in a string (ACA / compose
 // copy-paste; some docs use spaces inside parens). bracePlaceholder matches "${...}" (unexpanded
 // Bicep-style or env templates). windowsEnvPlaceholder matches unexpanded "%VAR%" (Windows-style refs).
@@ -705,6 +737,20 @@ func fallbackServiceInstanceID() string {
 
 func podNameFromEnv() string {
 	for _, k := range []string{envPodName, envContainerAppReplica} {
+		v := strings.TrimSpace(os.Getenv(k))
+		if v != "" && !isUnexpandedSubstitution(v) {
+			return v
+		}
+	}
+	return ""
+}
+
+// firstValidEnv returns the first env var value that is non-empty and not an
+// unexpanded placeholder ($(VAR) / ${VAR} / %VAR%). Used for git.* attributes
+// where either OTEL_GIT_* or DD_GIT_* may be the source of truth depending on
+// CI conventions.
+func firstValidEnv(keys ...string) string {
+	for _, k := range keys {
 		v := strings.TrimSpace(os.Getenv(k))
 		if v != "" && !isUnexpandedSubstitution(v) {
 			return v
@@ -771,6 +817,14 @@ func telemetryResource(serviceName, environment, version string) *resource.Resou
 		attrs = append(attrs, semconv.CloudRegion(v))
 	} else if v := strings.TrimSpace(os.Getenv(envGCPRegion)); v != "" && !isUnexpandedSubstitution(v) {
 		attrs = append(attrs, semconv.CloudRegion(v))
+	}
+	// Git Source Code Integration (Deployment Tracking / Version Tracking). Datadog
+	// reads the literal git.repository_url and git.commit.sha resource attributes.
+	if v := firstValidEnv(envOTELGitRepositoryURL, envDDGitRepositoryURL); v != "" {
+		attrs = append(attrs, attribute.String(attrKeyGitRepositoryURL, v))
+	}
+	if v := firstValidEnv(envOTELGitCommitSHA, envDDGitCommitSHA); v != "" {
+		attrs = append(attrs, attribute.String(attrKeyGitCommitSHA, v))
 	}
 	attrs = appendResourceAttributesFromEnv(attrs)
 	attrs = stripHostResourceAttributes(attrs)
