@@ -21,7 +21,7 @@ jobs:
 
     steps:
       - name: Checkout Full History
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Tag Commit
         uses: hydn-co/build-tools/.github/actions/create-tag@main
