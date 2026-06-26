@@ -52,6 +52,7 @@ import (
 	otellogglobal "go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
@@ -1016,8 +1017,28 @@ func newOTLPLogHandler(ctx context.Context, serviceName, version string, res *re
 	return lp, handler, nil
 }
 
+// counterOnlyDeltaTemporality makes monotonic counters export with delta
+// temporality while leaving gauges, histograms, and up/down counters cumulative.
+// Datadog's OTLP intake drops the first cumulative datapoint of a counter (no
+// predecessor to diff), so the first burst after a process (re)start is invisible
+// under the default cumulative temporality. Delta avoids that. Histograms and
+// gauges stay cumulative so existing dashboards/monitors are unaffected — this is
+// why we do not use the SDK's built-in DeltaTemporalitySelector, which also flips
+// histograms.
+func counterOnlyDeltaTemporality(kind sdkmetric.InstrumentKind) metricdata.Temporality {
+	switch kind {
+	case sdkmetric.InstrumentKindCounter, sdkmetric.InstrumentKindObservableCounter:
+		return metricdata.DeltaTemporality
+	default:
+		return metricdata.CumulativeTemporality
+	}
+}
+
 func newOTLPMetricProvider(ctx context.Context, res *resource.Resource) (*sdkmetric.MeterProvider, error) {
-	exp, err := otlpmetricgrpc.New(ctx, otlpmetricgrpc.WithInsecure())
+	exp, err := otlpmetricgrpc.New(ctx,
+		otlpmetricgrpc.WithInsecure(),
+		otlpmetricgrpc.WithTemporalitySelector(counterOnlyDeltaTemporality),
+	)
 	if err != nil {
 		return nil, err
 	}
