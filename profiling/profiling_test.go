@@ -57,8 +57,9 @@ func TestShouldUseDefaultsWhenPProfEnvUnsetOrInvalid(t *testing.T) {
 		t.Errorf("envSeconds(unset) = %v, want %v", got, defaultCapture)
 	}
 
-	// Invalid (non-positive / non-numeric) also falls back
-	for _, bad := range []string{"0", "-5", "abc"} {
+	// Invalid (non-positive / non-numeric / overflowing) also falls back. "10000000000" (1e10s) parses
+	// as a valid int but overflows when multiplied by time.Second, so it must not wrap to a bad duration.
+	for _, bad := range []string{"0", "-5", "abc", "10000000000"} {
 		t.Setenv(key, bad)
 
 		if got := envSeconds(key, defaultCapture); got != defaultCapture {

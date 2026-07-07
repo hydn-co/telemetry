@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	runtimepprof "runtime/pprof"
@@ -294,8 +295,12 @@ func envDuration(key string, def time.Duration) time.Duration {
 }
 
 func envSeconds(key string, def time.Duration) time.Duration {
+	// Cap so n*time.Second can't overflow int64 (which would wrap to a negative/tiny duration and make
+	// capture cycles fire immediately); an out-of-range value falls back to the default.
+	const maxSeconds = int64(math.MaxInt64) / int64(time.Second)
+
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && int64(n) <= maxSeconds {
 			return time.Duration(n) * time.Second
 		}
 	}
