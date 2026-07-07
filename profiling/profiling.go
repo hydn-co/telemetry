@@ -19,6 +19,7 @@ package profiling
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -224,6 +225,11 @@ func upload(ctx context.Context, client *azblob.Client, container, blobName stri
 	defer cancel()
 
 	if _, err := client.UploadBuffer(ctx, container, blobName, data, nil); err != nil {
+		if errors.Is(err, context.Canceled) {
+			// Expected when Stop() cancels the loop mid-upload during shutdown; not a real failure.
+			return
+		}
+
 		slog.ErrorContext(ctx, "pprof: upload failed",
 			slog.String("blob", blobName), slog.String("error", err.Error()))
 
