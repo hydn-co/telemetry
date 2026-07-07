@@ -6,7 +6,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestShouldDeriveBlobEndpointWhenTablesEndpointIsCloud(t *testing.T) {
@@ -51,53 +50,6 @@ func TestShouldReplaceUnsafeCharsWhenSanitizingBlobSegment(t *testing.T) {
 	}
 }
 
-func TestShouldUseDefaultsWhenPProfEnvUnsetOrInvalid(t *testing.T) {
-	// Arrange
-	const key = "MESH_PPROF_TEST_SECONDS"
-	t.Setenv(key, "")
-
-	// Act / Assert — unset falls back to default
-	if got := envSeconds(key, defaultCapture); got != defaultCapture {
-		t.Errorf("envSeconds(unset) = %v, want %v", got, defaultCapture)
-	}
-
-	// Invalid (non-positive / non-numeric / out-of-range) also falls back. "10000000000" (1e10s) is
-	// rejected either way: on 64-bit it parses but would overflow n*time.Second (caught by the cap); on
-	// 32-bit strconv.Atoi rejects it outright. Both paths must return the default, not a bad duration.
-	for _, bad := range []string{"0", "-5", "abc", "10000000000"} {
-		t.Setenv(key, bad)
-
-		if got := envSeconds(key, defaultCapture); got != defaultCapture {
-			t.Errorf("envSeconds(%q) = %v, want default %v", bad, got, defaultCapture)
-		}
-	}
-
-	// Valid parses to seconds
-	t.Setenv(key, "120")
-
-	if got := envSeconds(key, defaultCapture); got != 120*time.Second {
-		t.Errorf("envSeconds(120) = %v, want %v", got, 120*time.Second)
-	}
-}
-
-func TestShouldParseDurationWhenIntervalSet(t *testing.T) {
-	// Arrange
-	const key = "MESH_PPROF_TEST_INTERVAL"
-
-	// Act / Assert
-	t.Setenv(key, "90s")
-
-	if got := envDuration(key, defaultInterval); got != 90*time.Second {
-		t.Errorf("envDuration(90s) = %v, want %v", got, 90*time.Second)
-	}
-
-	t.Setenv(key, "garbage")
-
-	if got := envDuration(key, defaultInterval); got != defaultInterval {
-		t.Errorf("envDuration(garbage) = %v, want default %v", got, defaultInterval)
-	}
-}
-
 func TestShouldProduceSafeNonEmptyInstanceID(t *testing.T) {
 	// Arrange / Act
 	id := instanceID()
@@ -117,11 +69,10 @@ func TestShouldProduceSafeNonEmptyInstanceID(t *testing.T) {
 }
 
 func TestShouldReturnNoopStopWhenDisabled(t *testing.T) {
-	// Arrange
-	t.Setenv(envEnabled, "false")
+	// Arrange — Options.Enabled is false
 
 	// Act — must not start the loop and must return a callable stop func
-	stop := Start(context.Background(), "stream", "0.0.0")
+	stop := Start(context.Background(), Options{Service: "stream", Version: "0.0.0"})
 
 	// Assert — calling stop is safe (no goroutine to wait on)
 	stop()
@@ -129,11 +80,10 @@ func TestShouldReturnNoopStopWhenDisabled(t *testing.T) {
 
 func TestShouldReturnNoopStopWhenEnabledButNoBlobEndpoint(t *testing.T) {
 	// Arrange — enabled but AZURE_TABLES_ENDPOINT is not a cloud tables endpoint
-	t.Setenv(envEnabled, "true")
 	t.Setenv(envTables, "")
 
 	// Act
-	stop := Start(context.Background(), "stream", "0.0.0")
+	stop := Start(context.Background(), Options{Enabled: true, Service: "stream", Version: "0.0.0"})
 
 	// Assert
 	stop()

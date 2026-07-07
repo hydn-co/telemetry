@@ -6,19 +6,14 @@
 // It is a separate subpackage on purpose: only importers of this package pull in the Azure
 // blob/identity SDKs, so services that only need OTLP telemetry keep a lean dependency graph.
 //
-// Configuration is entirely from environment variables (shared across consumers so ops knowledge
-// transfers):
-//
-//   - MESH_PPROF_ENABLED   — "true"/"1" turns the loop on. Anything else is a no-op.
-//   - MESH_PPROF_SECONDS   — CPU capture window per cycle, in seconds (default 30).
-//   - MESH_PPROF_INTERVAL  — sleep between cycles, as a Go duration (default 5m).
-//   - MESH_PPROF_CONTAINER — blob container for uploads (default "pprof").
-//   - AZURE_TABLES_ENDPOINT — the blob endpoint is derived from this by swapping ".table." -> ".blob.".
-//   - AZURE_CLIENT_ID      — user-assigned managed identity to authenticate with (falls back to
-//     system-assigned when unset).
+// Feature configuration is passed in via [Options] — this package reads no feature flags from the
+// environment, so the caller owns any env-var naming. It does read the standard Azure environment for
+// infrastructure/credentials: AZURE_TABLES_ENDPOINT (the blob endpoint is derived from it by swapping
+// ".table." -> ".blob.") and AZURE_CLIENT_ID (the user-assigned managed identity to authenticate with;
+// falls back to system-assigned when unset).
 //
 // The managed identity needs Storage Blob Data Contributor on the account. Every error is logged and the
-// loop continues — profiling must never crash the service.
+// loop continues — profiling must never crash the caller.
 package profiling
 
 import (
@@ -26,7 +21,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math"
 	"net/url"
 	"os"
 	runtimepprof "runtime/pprof"
@@ -42,12 +36,8 @@ import (
 )
 
 const (
-	envEnabled   = "MESH_PPROF_ENABLED"
-	envSecondsK  = "MESH_PPROF_SECONDS"
-	envIntervalK = "MESH_PPROF_INTERVAL"
-	envContainer = "MESH_PPROF_CONTAINER"
-	envTables    = "AZURE_TABLES_ENDPOINT"
-	envClientID  = "AZURE_CLIENT_ID"
+	envTables   = "AZURE_TABLES_ENDPOINT"
+	envClientID = "AZURE_CLIENT_ID"
 
 	defaultCapture   = 30 * time.Second
 	defaultInterval  = 5 * time.Minute
@@ -58,17 +48,34 @@ const (
 	blobOpTimeout = 60 * time.Second
 )
 
-// Start launches the capture loop when MESH_PPROF_ENABLED is set, uploading CPU + heap profiles to blob
-// storage under <service>/<version>/. It returns a stop func (a no-op when disabled or misconfigured, so
-// callers can always defer it).
+// Options configures the capture loop. Enabled, Service, and Version are the meaningful inputs; the
+// remaining fields fall back to defaults when zero. The caller supplies these (e.g. from its own
+// environment variables) — this package defines no env-var names of its own.
+type Options struct {
+	// Enabled turns the loop on. When false, Start is a no-op.
+	Enabled bool
+	// Service and Version namespace uploaded blobs: <container>/<service>/<version>/...
+	Service string
+	Version string
+	// Capture is the CPU profile window per cycle (default 30s when <= 0).
+	Capture time.Duration
+	// Interval is the sleep between cycles (default 5m when <= 0).
+	Interval time.Duration
+	// Container is the blob container for uploads (default "pprof" when empty).
+	Container string
+}
+
+// Start launches the capture loop when opts.Enabled is set, uploading CPU + heap profiles to blob storage
+// under <service>/<version>/. It returns a stop func (a no-op when disabled or misconfigured, so callers
+// can always defer it).
 //
 // Call Start at most once per process: CPU profiling is process-global (runtime/pprof allows only one
 // active CPU profile), so a second concurrent loop would fail every StartCPUProfile and still upload
 // redundant heap profiles.
-func Start(ctx context.Context, service, version string) func() {
+func Start(ctx context.Context, opts Options) func() {
 	noop := func() {}
 
-	if !enabled() {
+	if !opts.Enabled {
 		return noop
 	}
 
@@ -76,7 +83,7 @@ func Start(ctx context.Context, service, version string) func() {
 	if endpoint == "" {
 		slog.WarnContext(ctx,
 			"pprof enabled but no blob endpoint could be derived from AZURE_TABLES_ENDPOINT; pprof not started",
-			slog.String("service", service))
+			slog.String("service", opts.Service))
 
 		return noop
 	}
@@ -95,11 +102,24 @@ func Start(ctx context.Context, service, version string) func() {
 		return noop
 	}
 
-	// Azure blob container names must be lowercase; normalize so a mixed-case override doesn't fail
+	// Azure blob container names must be lowercase; normalize so a mixed-case value doesn't fail
 	// CreateContainer/UploadBuffer every cycle.
-	container := strings.ToLower(envOrDefaultStr(envContainer, defaultContainer))
-	capture := envSeconds(envSecondsK, defaultCapture)
-	interval := envDuration(envIntervalK, defaultInterval)
+	container := strings.ToLower(strings.TrimSpace(opts.Container))
+	if container == "" {
+		container = defaultContainer
+	}
+
+	capture := opts.Capture
+	if capture <= 0 {
+		capture = defaultCapture
+	}
+
+	interval := opts.Interval
+	if interval <= 0 {
+		interval = defaultInterval
+	}
+
+	service, version := opts.Service, opts.Version
 
 	loopCtx, cancel := context.WithCancel(ctx)
 
@@ -214,15 +234,6 @@ func upload(ctx context.Context, client *azblob.Client, container, blobName stri
 	slog.DebugContext(ctx, "pprof: uploaded profile", slog.String("blob", blobName), slog.Int("bytes", len(data)))
 }
 
-func enabled() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv(envEnabled))) {
-	case "true", "1":
-		return true
-	default:
-		return false
-	}
-}
-
 // credential builds a managed-identity credential, honoring AZURE_CLIENT_ID for a user-assigned identity
 // and falling back to system-assigned otherwise.
 func credential() (azcore.TokenCredential, error) {
@@ -262,8 +273,8 @@ func blobEndpointFromTables(tables string) string {
 	}
 
 	// A storage service endpoint is scheme://host only. Reject anything carrying userinfo, a non-root
-	// path, a query, or a fragment — a well-formed AZURE_TABLES_ENDPOINT has none, and deriving a blob
-	// endpoint from such a URL would produce a wrong (or credential-bearing) target.
+	// path, a query, or a fragment — a well-formed tables endpoint has none, and deriving a blob endpoint
+	// from such a URL would produce a wrong (or credential-bearing) target.
 	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return ""
 	}
@@ -290,38 +301,6 @@ func blobEndpointFromTables(tables string) string {
 	u.Host = strings.Replace(host, ".table.", ".blob.", 1)
 
 	return u.String()
-}
-
-func envOrDefaultStr(key, def string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-
-	return def
-}
-
-func envDuration(key string, def time.Duration) time.Duration {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			return d
-		}
-	}
-
-	return def
-}
-
-func envSeconds(key string, def time.Duration) time.Duration {
-	// Cap so n*time.Second can't overflow int64 (which would wrap to a negative/tiny duration and make
-	// capture cycles fire immediately); an out-of-range value falls back to the default.
-	const maxSeconds = int64(math.MaxInt64) / int64(time.Second)
-
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && int64(n) <= maxSeconds {
-			return time.Duration(n) * time.Second
-		}
-	}
-
-	return def
 }
 
 // instanceID returns a per-process token (hostname + pid) used to keep blob names unique across replicas
