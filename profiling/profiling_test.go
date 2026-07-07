@@ -68,6 +68,34 @@ func TestShouldProduceSafeNonEmptyInstanceID(t *testing.T) {
 	}
 }
 
+func TestShouldValidateContainerNamesAgainstAzureRules(t *testing.T) {
+	// Arrange
+	valid := []string{"pprof", "a-b-1", "abc", strings.Repeat("a", 63)}
+	invalid := []string{
+		"ab",                    // too short (<3)
+		strings.Repeat("a", 64), // too long (>63)
+		"has_underscore",        // underscore not allowed
+		"has space",             // space not allowed
+		"-lead",                 // leading hyphen
+		"trail-",                // trailing hyphen
+		"a--b",                  // consecutive hyphens
+		"",                      // empty
+	}
+
+	// Act / Assert
+	for _, s := range valid {
+		if !validContainerName(s) {
+			t.Errorf("validContainerName(%q) = false, want true", s)
+		}
+	}
+
+	for _, s := range invalid {
+		if validContainerName(s) {
+			t.Errorf("validContainerName(%q) = true, want false", s)
+		}
+	}
+}
+
 func TestShouldReturnNoopStopWhenDisabled(t *testing.T) {
 	// Arrange — Options.Enabled is false
 

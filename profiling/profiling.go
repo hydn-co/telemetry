@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"regexp"
 	runtimepprof "runtime/pprof"
 	"strconv"
 	"strings"
@@ -105,8 +106,15 @@ func Start(ctx context.Context, opts Options) func() {
 
 	// Azure blob container names must be lowercase; normalize so a mixed-case value doesn't fail
 	// CreateContainer/UploadBuffer every cycle.
+	// Azure blob container names must be lowercase; normalize, then fall back to the default for an empty
+	// or otherwise invalid value so a misconfiguration can't fail CreateContainer/UploadBuffer every cycle.
 	container := strings.ToLower(strings.TrimSpace(opts.Container))
 	if container == "" {
+		container = defaultContainer
+	} else if !validContainerName(container) {
+		slog.WarnContext(ctx, "pprof: invalid blob container name; using default",
+			slog.String("container", container), slog.String("default", defaultContainer))
+
 		container = defaultContainer
 	}
 
@@ -318,6 +326,16 @@ func instanceID() string {
 	}
 
 	return sanitizeBlobSegment(fmt.Sprintf("%s-%d", host, os.Getpid()))
+}
+
+// containerNameRE matches the body of a valid Azure blob container name: lowercase letters/digits, with
+// single (non-consecutive) hyphens allowed only between them (so no leading/trailing/double hyphen).
+var containerNameRE = regexp.MustCompile(`^[a-z0-9](-?[a-z0-9])*$`)
+
+// validContainerName reports whether s satisfies Azure's blob container naming rules (3–63 chars,
+// lowercase alphanumerics and single interior hyphens). Callers pass an already-lowercased value.
+func validContainerName(s string) bool {
+	return len(s) >= 3 && len(s) <= 63 && containerNameRE.MatchString(s)
 }
 
 // sanitizeBlobSegment keeps blob path segments to safe characters.
