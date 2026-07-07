@@ -23,6 +23,10 @@ func TestShouldDeriveBlobEndpointWhenTablesEndpointIsCloud(t *testing.T) {
 		"https://evil.com/?x=.table.":          "", // ".table." not in an Azure host
 		"https://acct.table.core.windows.net.evil.com/": "", // look-alike host, wrong suffix
 		"http://acct.table.core.windows.net/":           "", // non-https: never send tokens over plaintext
+		"https://acct.table.core.windows.net/path":      "", // non-root path: not a bare service endpoint
+		"https://acct.table.core.windows.net/?sig=x":    "", // query string (e.g. SAS): rejected
+		"https://user:pw@acct.table.core.windows.net/":  "", // userinfo: rejected
+		"https://acct.table.core.windows.net/#frag":     "", // fragment: rejected
 	}
 
 	for in, want := range cases {

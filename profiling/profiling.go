@@ -153,6 +153,10 @@ func captureCycle(
 ) {
 	defer func() {
 		if r := recover(); r != nil {
+			// A panic between StartCPUProfile and StopCPUProfile would leave the process-global CPU profile
+			// running, so every subsequent cycle's StartCPUProfile would fail. StopCPUProfile is a safe
+			// no-op when none is active, so call it unconditionally on the panic path.
+			runtimepprof.StopCPUProfile()
 			slog.ErrorContext(ctx, "pprof: capture cycle panicked", slog.Any("recover", r))
 		}
 	}()
@@ -254,6 +258,13 @@ func blobEndpointFromTables(tables string) string {
 
 	u, err := url.Parse(tables)
 	if err != nil || u.Scheme != "https" {
+		return ""
+	}
+
+	// A storage service endpoint is scheme://host only. Reject anything carrying userinfo, a non-root
+	// path, a query, or a fragment — a well-formed AZURE_TABLES_ENDPOINT has none, and deriving a blob
+	// endpoint from such a URL would produce a wrong (or credential-bearing) target.
+	if u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return ""
 	}
 
