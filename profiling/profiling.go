@@ -1,7 +1,7 @@
 // Package profiling provides a periodic runtime/pprof capture-to-blob loop for services that have no
 // reachable /debug/pprof endpoint (no ingress, container exec blocked) but do write state to an Azure
-// storage account. It captures CPU + heap profiles and uploads them to that account's blob service,
-// authenticated with the service's managed identity.
+// storage account. It captures CPU, heap, and goroutine profiles and uploads them to that account's blob
+// service, authenticated with the service's managed identity.
 //
 // It is a separate subpackage on purpose: only importers of this package pull in the Azure
 // blob/identity SDKs, so services that only need OTLP telemetry keep a lean dependency graph.
@@ -67,7 +67,7 @@ type Options struct {
 	Container string
 }
 
-// Start launches the capture loop when opts.Enabled is set, uploading CPU + heap profiles to blob storage
+// Start launches the capture loop when opts.Enabled is set, uploading CPU, heap, and goroutine profiles to blob storage
 // under <service>/<version>/. It returns a stop func (a no-op when disabled or misconfigured, so callers
 // can always defer it).
 //
@@ -180,7 +180,7 @@ func Start(ctx context.Context, opts Options) func() {
 	}
 }
 
-// captureCycle captures one CPU profile (over captureDur) plus a heap snapshot and uploads both.
+// captureCycle captures one CPU profile (over captureDur) plus heap and goroutine snapshots, uploading all three.
 // It recovers from any panic so a bad capture never takes down the service.
 func captureCycle(
 	ctx context.Context,
@@ -228,6 +228,18 @@ func captureCycle(
 	}
 
 	upload(ctx, client, container, fmt.Sprintf("%s/heap-%s-%s.pprof", prefix, ts, instance), heap.Bytes())
+
+	// Goroutine dump at debug=2: full per-goroutine stacks including blocked-on state. Cheap (a
+	// snapshot), and the one artifact that reveals a hang/deadlock — a stalled service shows little on
+	// the CPU profile precisely because it's blocked, not running.
+	var goroutines bytes.Buffer
+	if err := runtimepprof.Lookup("goroutine").WriteTo(&goroutines, 2); err != nil {
+		slog.ErrorContext(ctx, "pprof: goroutine profile failed", slog.String("error", err.Error()))
+
+		return
+	}
+
+	upload(ctx, client, container, fmt.Sprintf("%s/goroutine-%s-%s.txt", prefix, ts, instance), goroutines.Bytes())
 }
 
 func upload(ctx context.Context, client *azblob.Client, container, blobName string, data []byte) {
