@@ -1,0 +1,107 @@
+package profiling
+
+import (
+	"context"
+	"testing"
+	"time"
+)
+
+func TestShouldDeriveBlobEndpointWhenTablesEndpointIsCloud(t *testing.T) {
+	// Arrange
+	cases := map[string]string{
+		"https://acct.table.core.windows.net/":    "https://acct.blob.core.windows.net/",
+		"https://acct.table.core.windows.net":     "https://acct.blob.core.windows.net",
+		"http://127.0.0.1:10002/devstoreaccount1": "", // Azurite path-style: no ".table." segment
+		"":                                     "",
+		"https://acct.queue.core.windows.net/": "", // not a tables endpoint
+	}
+
+	for in, want := range cases {
+		// Act
+		got := blobEndpointFromTables(in)
+
+		// Assert
+		if got != want {
+			t.Errorf("blobEndpointFromTables(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestShouldReplaceUnsafeCharsWhenSanitizingBlobSegment(t *testing.T) {
+	// Arrange / Act / Assert
+	if got := sanitizeBlobSegment("stream/0.2.0 RC"); got != "stream-0.2.0-RC" {
+		t.Errorf("sanitizeBlobSegment = %q, want %q", got, "stream-0.2.0-RC")
+	}
+
+	if got := sanitizeBlobSegment(""); got != "unknown" {
+		t.Errorf("sanitizeBlobSegment(empty) = %q, want %q", got, "unknown")
+	}
+}
+
+func TestShouldUseDefaultsWhenPProfEnvUnsetOrInvalid(t *testing.T) {
+	// Arrange
+	const key = "MESH_PPROF_TEST_SECONDS"
+	t.Setenv(key, "")
+
+	// Act / Assert — unset falls back to default
+	if got := envSeconds(key, defaultCapture); got != defaultCapture {
+		t.Errorf("envSeconds(unset) = %v, want %v", got, defaultCapture)
+	}
+
+	// Invalid (non-positive / non-numeric) also falls back
+	for _, bad := range []string{"0", "-5", "abc"} {
+		t.Setenv(key, bad)
+
+		if got := envSeconds(key, defaultCapture); got != defaultCapture {
+			t.Errorf("envSeconds(%q) = %v, want default %v", bad, got, defaultCapture)
+		}
+	}
+
+	// Valid parses to seconds
+	t.Setenv(key, "120")
+
+	if got := envSeconds(key, defaultCapture); got != 120*time.Second {
+		t.Errorf("envSeconds(120) = %v, want %v", got, 120*time.Second)
+	}
+}
+
+func TestShouldParseDurationWhenIntervalSet(t *testing.T) {
+	// Arrange
+	const key = "MESH_PPROF_TEST_INTERVAL"
+
+	// Act / Assert
+	t.Setenv(key, "90s")
+
+	if got := envDuration(key, defaultInterval); got != 90*time.Second {
+		t.Errorf("envDuration(90s) = %v, want %v", got, 90*time.Second)
+	}
+
+	t.Setenv(key, "garbage")
+
+	if got := envDuration(key, defaultInterval); got != defaultInterval {
+		t.Errorf("envDuration(garbage) = %v, want default %v", got, defaultInterval)
+	}
+}
+
+func TestShouldReturnNoopStopWhenDisabled(t *testing.T) {
+	// Arrange
+	t.Setenv(envEnabled, "false")
+
+	// Act — must not start the loop and must return a callable stop func
+	stop := Start(context.Background(), "stream", "0.0.0")
+
+	// Assert — calling stop is safe (no goroutine to wait on)
+	stop()
+}
+
+func TestShouldReturnNoopStopWhenEnabledButNoBlobEndpoint(t *testing.T) {
+	// Arrange — enabled but AZURE_TABLES_ENDPOINT is not a cloud tables endpoint
+	t.Setenv(envEnabled, "true")
+	t.Setenv(envTables, "")
+
+	// Act
+	stop := Start(context.Background(), "stream", "0.0.0")
+
+	// Assert
+	stop()
+}
