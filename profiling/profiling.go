@@ -104,8 +104,6 @@ func Start(ctx context.Context, opts Options) func() {
 		return noop
 	}
 
-	// Azure blob container names must be lowercase; normalize so a mixed-case value doesn't fail
-	// CreateContainer/UploadBuffer every cycle.
 	// Azure blob container names must be lowercase; normalize, then fall back to the default for an empty
 	// or otherwise invalid value so a misconfiguration can't fail CreateContainer/UploadBuffer every cycle.
 	container := strings.ToLower(strings.TrimSpace(opts.Container))
