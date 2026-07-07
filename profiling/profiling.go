@@ -61,6 +61,10 @@ const (
 // Start launches the capture loop when MESH_PPROF_ENABLED is set, uploading CPU + heap profiles to blob
 // storage under <service>/<version>/. It returns a stop func (a no-op when disabled or misconfigured, so
 // callers can always defer it).
+//
+// Call Start at most once per process: CPU profiling is process-global (runtime/pprof allows only one
+// active CPU profile), so a second concurrent loop would fail every StartCPUProfile and still upload
+// redundant heap profiles.
 func Start(ctx context.Context, service, version string) func() {
 	noop := func() {}
 
@@ -202,7 +206,8 @@ func upload(ctx context.Context, client *azblob.Client, container, blobName stri
 		return
 	}
 
-	slog.InfoContext(ctx, "pprof: uploaded profile", slog.String("blob", blobName), slog.Int("bytes", len(data)))
+	// Debug, not Info: this fires twice per cycle per replica; Info is reserved for lifecycle events.
+	slog.DebugContext(ctx, "pprof: uploaded profile", slog.String("blob", blobName), slog.Int("bytes", len(data)))
 }
 
 func enabled() bool {
