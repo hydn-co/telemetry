@@ -26,6 +26,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	runtimepprof "runtime/pprof"
 	"strconv"
@@ -85,7 +86,9 @@ func Start(ctx context.Context, service, version string) func() {
 		return noop
 	}
 
-	container := envOrDefaultStr(envContainer, defaultContainer)
+	// Azure blob container names must be lowercase; normalize so a mixed-case override doesn't fail
+	// CreateContainer/UploadBuffer every cycle.
+	container := strings.ToLower(envOrDefaultStr(envContainer, defaultContainer))
 	capture := envSeconds(envSecondsK, defaultCapture)
 	interval := envDuration(envIntervalK, defaultInterval)
 
@@ -209,12 +212,45 @@ func credential() (azcore.TokenCredential, error) {
 	return azidentity.NewManagedIdentityCredential(nil)
 }
 
+// azureTableHostSuffixes are the DNS suffixes of Azure Storage table endpoints across the public and
+// sovereign clouds. blobEndpointFromTables only derives a blob endpoint for hosts under these, so a
+// misconfigured (or attacker-controlled) AZURE_TABLES_ENDPOINT cannot make the loop send managed-identity
+// bearer tokens to an arbitrary host.
+var azureTableHostSuffixes = []string{
+	".table.core.windows.net",       // public
+	".table.core.usgovcloudapi.net", // US Gov
+	".table.core.chinacloudapi.cn",  // China (21Vianet)
+}
+
 // blobEndpointFromTables derives the blob service endpoint from an Azure Tables endpoint by swapping the
 // service segment (e.g. https://acct.table.core.windows.net/ -> https://acct.blob.core.windows.net/).
-// Returns "" for non-cloud (e.g. Azurite path-style) endpoints; pprof is a deployed-env-only diagnostic.
+// It only accepts an https URL whose host is a known Azure Storage table domain; everything else (non-
+// cloud/Azurite path-style, non-https, or an unexpected host) returns "" — pprof is a deployed-env-only
+// diagnostic and must never point managed-identity auth at an untrusted endpoint.
 func blobEndpointFromTables(tables string) string {
 	tables = strings.TrimSpace(tables)
-	if tables == "" || !strings.Contains(tables, ".table.") {
+	if tables == "" {
+		return ""
+	}
+
+	u, err := url.Parse(tables)
+	if err != nil || u.Scheme != "https" {
+		return ""
+	}
+
+	host := strings.ToLower(u.Hostname())
+
+	trusted := false
+
+	for _, suffix := range azureTableHostSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			trusted = true
+
+			break
+		}
+	}
+
+	if !trusted {
 		return ""
 	}
 

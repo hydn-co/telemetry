@@ -12,11 +12,16 @@ import (
 func TestShouldDeriveBlobEndpointWhenTablesEndpointIsCloud(t *testing.T) {
 	// Arrange
 	cases := map[string]string{
-		"https://acct.table.core.windows.net/":    "https://acct.blob.core.windows.net/",
-		"https://acct.table.core.windows.net":     "https://acct.blob.core.windows.net",
-		"http://127.0.0.1:10002/devstoreaccount1": "", // Azurite path-style: no ".table." segment
+		"https://acct.table.core.windows.net/":      "https://acct.blob.core.windows.net/",
+		"https://acct.table.core.windows.net":       "https://acct.blob.core.windows.net",
+		"https://acct.table.core.usgovcloudapi.net": "https://acct.blob.core.usgovcloudapi.net", // sovereign
+		"https://acct.table.core.chinacloudapi.cn":  "https://acct.blob.core.chinacloudapi.cn",  // sovereign
+		"http://127.0.0.1:10002/devstoreaccount1":   "",                                         // Azurite path-style
 		"":                                     "",
 		"https://acct.queue.core.windows.net/": "", // not a tables endpoint
+		"https://evil.com/?x=.table.":          "", // ".table." not in an Azure host
+		"https://acct.table.core.windows.net.evil.com/": "", // look-alike host, wrong suffix
+		"http://acct.table.core.windows.net/":           "", // non-https: never send tokens over plaintext
 	}
 
 	for in, want := range cases {
