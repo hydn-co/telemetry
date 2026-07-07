@@ -14,6 +14,7 @@ func TestShouldDeriveBlobEndpointWhenTablesEndpointIsCloud(t *testing.T) {
 	cases := map[string]string{
 		"https://acct.table.core.windows.net/":      "https://acct.blob.core.windows.net/",
 		"https://acct.table.core.windows.net":       "https://acct.blob.core.windows.net",
+		"https://ACCT.TABLE.CORE.WINDOWS.NET/":      "https://acct.blob.core.windows.net/",      // case-insensitive host, rewritten on host only
 		"https://acct.table.core.usgovcloudapi.net": "https://acct.blob.core.usgovcloudapi.net", // sovereign
 		"https://acct.table.core.chinacloudapi.cn":  "https://acct.blob.core.chinacloudapi.cn",  // sovereign
 		"http://127.0.0.1:10002/devstoreaccount1":   "",                                         // Azurite path-style

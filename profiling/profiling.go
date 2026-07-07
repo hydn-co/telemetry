@@ -51,6 +51,10 @@ const (
 	defaultCapture   = 30 * time.Second
 	defaultInterval  = 5 * time.Minute
 	defaultContainer = "pprof"
+
+	// blobOpTimeout bounds each best-effort blob operation (container ensure, profile upload) so a
+	// stalled network/MSI path can't hang the capture goroutine or delay shutdown.
+	blobOpTimeout = 60 * time.Second
 )
 
 // Start launches the capture loop when MESH_PPROF_ENABLED is set, uploading CPU + heap profiles to blob
@@ -92,13 +96,6 @@ func Start(ctx context.Context, service, version string) func() {
 	capture := envSeconds(envSecondsK, defaultCapture)
 	interval := envDuration(envIntervalK, defaultInterval)
 
-	// Best-effort container create; an already-existing container is not an error.
-	if _, err := client.CreateContainer(ctx, container, nil); err != nil &&
-		!bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
-		slog.WarnContext(ctx, "pprof: could not ensure blob container (will still attempt uploads)",
-			slog.String("container", container), slog.String("error", err.Error()))
-	}
-
 	loopCtx, cancel := context.WithCancel(ctx)
 
 	var wg sync.WaitGroup
@@ -112,6 +109,17 @@ func Start(ctx context.Context, service, version string) func() {
 			slog.String("service", service), slog.String("endpoint", endpoint),
 			slog.String("container", container), slog.Duration("capture", capture),
 			slog.Duration("interval", interval))
+
+		// Best-effort container ensure, in the goroutine (not Start) so a stalled MSI/network path never
+		// delays the caller's startup; an already-existing container is not an error. Bounded so it can't
+		// hang the first cycle.
+		ensureCtx, ensureCancel := context.WithTimeout(loopCtx, blobOpTimeout)
+		if _, err := client.CreateContainer(ensureCtx, container, nil); err != nil &&
+			!bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
+			slog.WarnContext(loopCtx, "pprof: could not ensure blob container (will still attempt uploads)",
+				slog.String("container", container), slog.String("error", err.Error()))
+		}
+		ensureCancel()
 
 		for {
 			captureCycle(loopCtx, client, container, service, version, capture)
@@ -181,6 +189,11 @@ func upload(ctx context.Context, client *azblob.Client, container, blobName stri
 		return
 	}
 
+	// Bound the upload so a stalled network can't hang the capture goroutine (still respects parent
+	// cancellation on shutdown).
+	ctx, cancel := context.WithTimeout(ctx, blobOpTimeout)
+	defer cancel()
+
 	if _, err := client.UploadBuffer(ctx, container, blobName, data, nil); err != nil {
 		slog.ErrorContext(ctx, "pprof: upload failed",
 			slog.String("blob", blobName), slog.String("error", err.Error()))
@@ -238,12 +251,13 @@ func blobEndpointFromTables(tables string) string {
 		return ""
 	}
 
-	host := strings.ToLower(u.Hostname())
+	host := strings.ToLower(u.Host)           // includes port, if any; DNS is case-insensitive so lowercasing is safe
+	hostname := strings.ToLower(u.Hostname()) // no port, for suffix matching
 
 	trusted := false
 
 	for _, suffix := range azureTableHostSuffixes {
-		if strings.HasSuffix(host, suffix) {
+		if strings.HasSuffix(hostname, suffix) {
 			trusted = true
 
 			break
@@ -254,7 +268,11 @@ func blobEndpointFromTables(tables string) string {
 		return ""
 	}
 
-	return strings.Replace(tables, ".table.", ".blob.", 1)
+	// Swap the service label in the host only (not userinfo/path/query), on the parsed URL, so an
+	// occurrence of ".table." elsewhere in the raw string can't corrupt the derived endpoint.
+	u.Host = strings.Replace(host, ".table.", ".blob.", 1)
+
+	return u.String()
 }
 
 func envOrDefaultStr(key, def string) string {
