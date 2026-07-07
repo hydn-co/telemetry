@@ -2,6 +2,9 @@ package profiling
 
 import (
 	"context"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -80,6 +83,24 @@ func TestShouldParseDurationWhenIntervalSet(t *testing.T) {
 
 	if got := envDuration(key, defaultInterval); got != defaultInterval {
 		t.Errorf("envDuration(garbage) = %v, want default %v", got, defaultInterval)
+	}
+}
+
+func TestShouldProduceSafeNonEmptyInstanceID(t *testing.T) {
+	// Arrange / Act
+	id := instanceID()
+
+	// Assert — non-empty, safe blob-segment chars, and includes the pid so it varies across processes
+	if id == "" {
+		t.Fatal("instanceID() is empty")
+	}
+
+	if got := sanitizeBlobSegment(id); got != id {
+		t.Errorf("instanceID() = %q is not a safe blob segment (sanitized: %q)", id, got)
+	}
+
+	if !strings.Contains(id, strconv.Itoa(os.Getpid())) {
+		t.Errorf("instanceID() = %q does not contain the pid %d", id, os.Getpid())
 	}
 }
 

@@ -141,8 +141,11 @@ func captureCycle(
 		}
 	}()
 
+	// instance disambiguates profiles captured in the same second by different replicas or restarts of
+	// the same service+version, so concurrent uploads to the same prefix don't overwrite each other.
 	prefix := fmt.Sprintf("%s/%s", sanitizeBlobSegment(service), sanitizeBlobSegment(version))
 	ts := time.Now().UTC().Format("20060102T150405Z")
+	instance := instanceID()
 
 	var cpu bytes.Buffer
 	if err := runtimepprof.StartCPUProfile(&cpu); err != nil {
@@ -157,7 +160,7 @@ func captureCycle(
 		}
 
 		runtimepprof.StopCPUProfile()
-		upload(ctx, client, container, fmt.Sprintf("%s/cpu-%s.pprof", prefix, ts), cpu.Bytes())
+		upload(ctx, client, container, fmt.Sprintf("%s/cpu-%s-%s.pprof", prefix, ts, instance), cpu.Bytes())
 	}
 
 	var heap bytes.Buffer
@@ -167,7 +170,7 @@ func captureCycle(
 		return
 	}
 
-	upload(ctx, client, container, fmt.Sprintf("%s/heap-%s.pprof", prefix, ts), heap.Bytes())
+	upload(ctx, client, container, fmt.Sprintf("%s/heap-%s-%s.pprof", prefix, ts, instance), heap.Bytes())
 }
 
 func upload(ctx context.Context, client *azblob.Client, container, blobName string, data []byte) {
@@ -244,6 +247,17 @@ func envSeconds(key string, def time.Duration) time.Duration {
 	}
 
 	return def
+}
+
+// instanceID returns a per-process token (hostname + pid) used to keep blob names unique across replicas
+// and restarts. Falls back to the pid alone if the hostname is unavailable.
+func instanceID() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		return sanitizeBlobSegment(strconv.Itoa(os.Getpid()))
+	}
+
+	return sanitizeBlobSegment(fmt.Sprintf("%s-%d", host, os.Getpid()))
 }
 
 // sanitizeBlobSegment keeps blob path segments to safe characters.
