@@ -81,11 +81,23 @@ func Start(ctx context.Context, opts Options) func() {
 		return noop
 	}
 
+	// Require Service + Version: they namespace the blob prefix (<service>/<version>/), so empty values
+	// would upload under "unknown/unknown" and silently mix profiles from different services.
+	service := strings.TrimSpace(opts.Service)
+	version := strings.TrimSpace(opts.Version)
+
+	if service == "" || version == "" {
+		slog.WarnContext(ctx, "pprof: Service and Version are required; pprof not started",
+			slog.String("service", service), slog.String("version", version))
+
+		return noop
+	}
+
 	endpoint := blobEndpointFromTables(os.Getenv(envTables))
 	if endpoint == "" {
 		slog.WarnContext(ctx,
 			"pprof enabled but no blob endpoint could be derived from AZURE_TABLES_ENDPOINT; pprof not started",
-			slog.String("service", opts.Service))
+			slog.String("service", service))
 
 		return noop
 	}
@@ -125,8 +137,6 @@ func Start(ctx context.Context, opts Options) func() {
 	if interval <= 0 {
 		interval = defaultInterval
 	}
-
-	service, version := opts.Service, opts.Version
 
 	loopCtx, cancel := context.WithCancel(ctx)
 

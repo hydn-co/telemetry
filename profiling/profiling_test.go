@@ -106,6 +106,23 @@ func TestShouldReturnNoopStopWhenDisabled(t *testing.T) {
 	stop()
 }
 
+func TestShouldReturnNoopStopWhenServiceOrVersionMissing(t *testing.T) {
+	// Arrange — enabled with a valid endpoint, but Service/Version blank must not start (would upload
+	// under "unknown/unknown").
+	t.Setenv(envTables, "https://acct.table.core.windows.net/")
+
+	// Act / Assert — both blank, and each missing individually
+	for _, o := range []Options{
+		{Enabled: true},
+		{Enabled: true, Service: "stream"},
+		{Enabled: true, Version: "1.0.0"},
+		{Enabled: true, Service: "  ", Version: "  "},
+	} {
+		stop := Start(context.Background(), o)
+		stop()
+	}
+}
+
 func TestShouldReturnNoopStopWhenEnabledButNoBlobEndpoint(t *testing.T) {
 	// Arrange — enabled but AZURE_TABLES_ENDPOINT is not a cloud tables endpoint
 	t.Setenv(envTables, "")
